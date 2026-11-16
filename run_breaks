@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════
-# claude-agents break runner
+# claude-spaces-agents break runner
 #
 # A green test only proves that it can pass. Each break below damages one thing
-# in a copy of claude-agents and names the tests that must go red because of it.
-# The real files are never touched.
+# in a copy of claude-spaces-agents and names the tests that must go red because
+# of it. The real files are never touched.
 #
-#   run_breaks_agents           every break, then the tests no break names
-#   run_breaks_agents <word>    only the breaks whose label or tests contain <word>
+#   run_breaks           every break, then the tests no break names
+#   run_breaks <word>    only the breaks whose label or tests contain <word>
 #
 # A break:
 #
@@ -18,23 +18,23 @@
 #   - a second place to damage in the same break (optional)
 #
 # The `-` lines must be in the file exactly once. A header ending in `| harness`
-# damages run_tests_agents instead: that is how the check that runs after every
+# damages run_tests instead: that is how the check that runs after every
 # test is itself seen to fail.
 #
 # When code changes, a break whose lines are gone is reported, not skipped.
 # ══════════════════════════════════════════════════
 
-if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
   for _bash in /opt/homebrew/bin/bash /usr/local/bin/bash; do
     [[ -x "$_bash" ]] && exec "$_bash" "$0" "$@"
   done
-  echo "ERROR: bash 4.3+ required (found ${BASH_VERSION})."
+  echo "ERROR: bash 4.4+ required (found ${BASH_VERSION})."
   exit 1
 fi
 
 HERE=$(dirname "$(readlink -f "$0")")
-SCRIPT=$(readlink -f "${SCRIPT_UNDER_TEST:-${HERE}/claude-agents}")
-TESTS="${HERE}/run_tests_agents"
+SCRIPT=$(readlink -f "${SCRIPT_UNDER_TEST:-${HERE}/claude-spaces-agents}")
+TESTS="${HERE}/run_tests"
 FILTER="${1:-}"
 
 RED='\033[31m'
@@ -104,10 +104,10 @@ apply_break() {
   local n="$1" src dst h key i j k hits at
   if [[ "${B_TARGET[n]}" == "harness" ]]; then
     src="${TESTS}"
-    dst="${WORK}/run_tests_agents"
+    dst="${WORK}/run_tests"
   else
     src="${SCRIPT}"
-    dst="${WORK}/claude-agents"
+    dst="${WORK}/claude-spaces-agents"
   fi
   local -a lines old new
   mapfile -t lines < "${src}"
@@ -171,7 +171,7 @@ baseline() {
 }
 
 main() {
-  echo "claude-agents breaks"
+  echo "claude-spaces-agents breaks"
   echo "══════════════════════════════════"
   echo "script: ${SCRIPT}"
   echo ""
@@ -550,9 +550,9 @@ load_breaks << 'BREAKS'
 +   local id="$1" orient="$2" tp cur size
 
 @@ a parked terminal's window is not pinned to its size | test_term_survives_switch test_slot_sweep test_e2e_parking_keeps_terminal_size
--   if ! _tmux set -p -t "${slot}" @ca_placeholder 1 \; \
+-   if ! _tmux set -p -t "${slot}" @csa_placeholder 1 \; \
 -              resize-window -t "${slot}" -x "${PANE_W[${tp}]}" -y "${PANE_H[${tp}]}" 2>/dev/null; then
-+   if ! _tmux set -p -t "${slot}" @ca_placeholder 1 2>/dev/null; then
++   if ! _tmux set -p -t "${slot}" @csa_placeholder 1 2>/dev/null; then
 
 @@ terminals of the same layout do not trade places | test_term_same_layout_swap test_switch_chain_order
 -   elif [[ -n "${out_tp}" && -n "${in_tp}" && "${in_orient}" == "${out_orient}" \
@@ -578,7 +578,7 @@ load_breaks << 'BREAKS'
 +   cs_refresh_geom
 
 @@ a parked terminal's window is not named | test_term_hide_and_show
--   cs_rename_pane_window "${tp}" "ca:term"
+-   cs_rename_pane_window "${tp}" "csa:term"
 
 @@ a terminal's orientation is not remembered | test_term_orientation_change
 -   echo "${orient}" > "${STATE_DIR}/term/${id}.orient"
@@ -805,7 +805,7 @@ load_breaks << 'BREAKS'
 -   fi
 
 @@ the launcher says nothing after a layout change | test_e2e_compat_gate
--       echo "claude-agents was updated and the layout changed, so the view was closed."
+-       echo "claude-spaces-agents was updated and the layout changed, so the view was closed."
 +       echo "closed."
 
 # ── the check that runs after every test ─────────

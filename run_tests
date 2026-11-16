@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════
-# claude-agents tests
+# claude-spaces-agents tests
 #
-#   run_tests_agents               lint, then every test
-#   run_tests_agents <test_name>   that one test only, no lint
+#   run_tests               lint, then every test
+#   run_tests <test_name>   that one test only, no lint
 #
-# Same approach as run_tests: an isolated tmux server and the script's functions
-# evaluated up to its entrypoint. Claude is a fake `claude` on PATH, so no real
-# session is ever started. The launcher tests run the real script in a terminal:
-# a pane of a second, outer tmux server.
+# Same approach as claude-spaces' run_tests: an isolated tmux server and the
+# script's functions evaluated up to its entrypoint. Claude is a fake `claude` on
+# PATH, so no real session is ever started. The launcher tests run the real
+# script in a terminal: a pane of a second, outer tmux server.
 #
 # After every test an invariant check looks at the panes, windows and state
-# files that are left (ca_assert_consistent).
+# files that are left (csa_assert_consistent).
 # ══════════════════════════════════════════════════
 
-# Re-exec under bash 4.3+ on macOS if needed
-if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
+# Re-exec under bash 4.4+ on macOS if needed
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
   for _bash in /opt/homebrew/bin/bash /usr/local/bin/bash; do
     [[ -x "$_bash" ]] && exec "$_bash" "$0" "$@"
   done
-  echo "ERROR: bash 4.3+ required (found ${BASH_VERSION})."
+  echo "ERROR: bash 4.4+ required (found ${BASH_VERSION})."
   exit 1
 fi
 
-SCRIPT_UNDER_TEST="${SCRIPT_UNDER_TEST:-$(dirname "$(readlink -f "$0")")/claude-agents}"
+SCRIPT_UNDER_TEST="${SCRIPT_UNDER_TEST:-$(dirname "$(readlink -f "$0")")/claude-spaces-agents}"
 SCRIPT_UNDER_TEST=$(readlink -f "${SCRIPT_UNDER_TEST}")
 ONLY="${1:-}"
 
@@ -379,7 +379,7 @@ show_with_terminal() {
 
 # ── State invariant checker ──────────────────────
 # What must hold whenever the picker is idle, whatever the test did.
-ca_assert_consistent() {
+csa_assert_consistent() {
   local label="$1" errors=0
   local pp cp displayed
   pp=$(cat "${STATE_DIR}/picker_pane" 2>/dev/null)
@@ -392,7 +392,7 @@ ca_assert_consistent() {
     [[ -n "${p}" ]] || continue
     win["${p}"]="${w}"
     tagged["${p}"]="${t}"
-  done < <(_tmux list-panes -a -F '#{pane_id} #{window_id} #{?@ca_placeholder,1,0}' 2>/dev/null)
+  done < <(_tmux list-panes -a -F '#{pane_id} #{window_id} #{?@csa_placeholder,1,0}' 2>/dev/null)
 
   # 1. the picker pane is alive and was never respawned
   if [[ -z "${pp}" || -z "${win[${pp}]:-}" ]]; then
@@ -510,7 +510,7 @@ e2e_inner() {
 }
 
 e2e_state() {
-  echo "${TEST_TMP}/e2e/run/claude-agents/$(cs_sanitize_path "$(e2e_project "$1")")"
+  echo "${TEST_TMP}/e2e/run/claude-spaces-agents/$(cs_sanitize_path "$(e2e_project "$1")")"
 }
 
 e2e_cleanup() {
@@ -588,9 +588,9 @@ e2e_picker_text() {
 # ── Setup / teardown ─────────────────────────────
 cs_test_setup() {
   TEST_TMP=$(mktemp -d)
-  TEST_SESSION="ca-test-$$"
-  TMUX_SERVER="ca-test-$$"
-  E2E_OUTER="ca-test-outer-$$"
+  TEST_SESSION="csa-test-$$"
+  TMUX_SERVER="csa-test-$$"
+  E2E_OUTER="csa-test-outer-$$"
   export TERM="${TERM:-xterm}"
 
   mkdir -p "${TEST_TMP}/state/term" "${TEST_TMP}/state-root" "${TEST_TMP}/claude/projects/proj"
@@ -716,7 +716,7 @@ run_test() {
   cs_test_reset
   echo -n "  ${name} ... "
   local output
-  if output=$("$@" 2>&1) && output+=$(ca_assert_consistent "after $1" 2>&1); then
+  if output=$("$@" 2>&1) && output+=$(csa_assert_consistent "after $1" 2>&1); then
     echo -e "${GREEN}PASS${RESET}"
     ((PASS_COUNT++))
   else
@@ -922,11 +922,11 @@ test_invariant_check_notices() {
   show_with_terminal aaaaaaa1 bottom || { fail "setup failed"; return 1; }
   local out tp stray
   tp=$(term_pane_of aaaaaaa1)
-  out=$(ca_assert_consistent "in order") || { fail "a state in order was reported: ${out}"; return 1; }
+  out=$(csa_assert_consistent "in order") || { fail "a state in order was reported: ${out}"; return 1; }
 
   # notices <what the check must say> — true when it fails and says it
   notices() {
-    if out=$(ca_assert_consistent "probe"); then
+    if out=$(csa_assert_consistent "probe"); then
       fail "went unnoticed: $1"
       return 1
     fi
@@ -935,7 +935,7 @@ test_invariant_check_notices() {
 
   stray=$(_tmux new-window -d -P -F '#{pane_id}' "sleep 99999")
   notices "untracked pane ${stray}" || return 1
-  _tmux set -p -t "${stray}" @ca_placeholder 1
+  _tmux set -p -t "${stray}" @csa_placeholder 1
   notices "placeholder pane ${stray}" || return 1
   _tmux kill-pane -t "${stray}"
 
@@ -975,7 +975,7 @@ test_invariant_check_notices() {
   notices "terminal of the displayed session is parked" || return 1
   cs_term_show aaaaaaa1 bottom || { fail "could not bring the terminal back"; return 1; }
 
-  out=$(ca_assert_consistent "put back") || { fail "not in order after putting everything back: ${out}"; return 1; }
+  out=$(csa_assert_consistent "put back") || { fail "not in order after putting everything back: ${out}"; return 1; }
 }
 
 # ── Tests: the client pane ───────────────────────
@@ -1141,7 +1141,7 @@ test_switch_failure_ends_on_welcome() {
     return 1
   fi
   local tagged
-  tagged=$(_tmux list-panes -a -F '#{?@ca_placeholder,1,0}' | grep -c 1)
+  tagged=$(_tmux list-panes -a -F '#{?@csa_placeholder,1,0}' | grep -c 1)
   assert_eq "placeholders left" "${tagged}" "0"
 }
 
@@ -1461,7 +1461,7 @@ test_footer_note() {
   local -a row
   local hints version note
   hints=$(centered40 "Q:detach  ?:help")
-  version=$(centered40 "claude-agents v${VERSION}")
+  version=$(centered40 "spaces-agents v${VERSION}")
 
   # 40 columns by 20 rows: 1 header, 2-3 sessions, 4 empty, 5-6 key hints
   screen_rows 40 20
@@ -1906,7 +1906,7 @@ test_term_hide_and_show() {
   fi
   assert_eq "size while hidden" "$(pane_size "${tp}")" "${size}" || return 1
   assert_eq "SIGWINCH on hiding" "$(term_winch "${tp}")" "${t0}" || return 1
-  assert_eq "window name" "$(_tmux display-message -p -t "${tp}" '#{window_name}')" "ca:term" || return 1
+  assert_eq "window name" "$(_tmux display-message -p -t "${tp}" '#{window_name}')" "csa:term" || return 1
 
   cs_term_toggle
   settle
@@ -2696,7 +2696,7 @@ test_e2e_hop() {
 
 # ── Main ─────────────────────────────────────────
 main() {
-  echo "claude-agents tests"
+  echo "claude-spaces-agents tests"
   echo "══════════════════════════════════"
   echo ""
 

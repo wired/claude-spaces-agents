@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════
-# claude-agents — tmux picker for Claude Code background sessions
+# claude-spaces-agents — tmux picker for Claude Code background sessions
 # Version 0.1.0-dev
 #
 # Copyright (c) 2026 Alex Alexander <alex.alexander@gmail.com>
 # Licensed under MIT
 # ══════════════════════════════════════════════════
 #
-# Prototype, forked from claude-spaces. Design: specs/claude-agents.md
+# Prototype, forked from claude-spaces. Design: SPEC.md
 #
 # Usage:
-#   claude-agents          Launch picker (inside or outside tmux)
-#   claude-agents --reset  Close the view and clear its state (sessions keep running)
+#   claude-spaces-agents          Launch picker (inside or outside tmux)
+#   claude-spaces-agents --reset  Close the view and clear its state (sessions keep running)
 
-# Re-exec under bash 4.3+ on macOS if needed (namerefs require 4.3)
-if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
+# Re-exec under bash 4.4+ on macOS if needed (${var@Q} requires 4.4)
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
   for _bash in /opt/homebrew/bin/bash /usr/local/bin/bash; do
     [[ -x "$_bash" ]] && exec "$_bash" "$0" "$@"
   done
-  echo "ERROR: bash 4.3+ required (found ${BASH_VERSION}). On macOS: brew install bash and add Homebrew's bin to your PATH before /bin"
+  echo "ERROR: bash 4.4+ required (found ${BASH_VERSION}). On macOS: brew install bash and add Homebrew's bin to your PATH before /bin"
   exit 1
 fi
 
@@ -43,8 +43,8 @@ cs_normalize_pwd
 export CLAUDE_CODE_DISABLE_AGENT_VIEW=0
 CLAUDE_DIR="${HOME}/.claude"
 PROJECTS_DIR="${CLAUDE_DIR}/projects"
-CS_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-agents"
-CS_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/claude-agents"
+CS_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-spaces-agents"
+CS_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/claude-spaces-agents"
 CONFIG_FILE="${CS_CONFIG_DIR}/config"
 PROJECT_NAMES_FILE="${CS_DATA_DIR}/project_names"
 # seen/<id>: empty file whose mtime is when that session was last shown
@@ -53,9 +53,9 @@ SEEN_DIR="${CS_DATA_DIR}/seen"
 # /tmp fallback, append -${UID} to prevent cross-user collisions on shared hosts.
 # This is the default only — the state_root config key overrides it.
 if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
-  CS_STATE_ROOT="${XDG_RUNTIME_DIR}/claude-agents"
+  CS_STATE_ROOT="${XDG_RUNTIME_DIR}/claude-spaces-agents"
 else
-  CS_STATE_ROOT="/tmp/claude-agents-${UID}"
+  CS_STATE_ROOT="/tmp/claude-spaces-agents-${UID}"
 fi
 
 # ── Compatibility ─────────────────────────────────
@@ -84,7 +84,7 @@ cs_server_name() {
   sum=$(printf '%s' "$1" | cksum | cut -d' ' -f1)
   tail="${1: -30}"
   tail="${tail//\//-}"
-  printf 'ca-%s-%s' "$tail" "$sum"
+  printf 'csa-%s-%s' "$tail" "$sum"
 }
 TMUX_SERVER=$(cs_server_name "$PWD")
 TMUX_CONF="${HOME}/.tmux.conf"
@@ -112,9 +112,9 @@ ID_RE='^[0-9a-f]{8}$'
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 # Titles the picker gives the client pane. tmux keeps a pane's title across
 # respawn-pane and after its program exits, so every respawn sets one of these.
-CS_T_SWITCHING="claude-agents:switching"
-CS_T_WELCOME="claude-agents:welcome"
-CS_T_AGENTS="claude-agents:agents"
+CS_T_SWITCHING="claude-spaces-agents:switching"
+CS_T_WELCOME="claude-spaces-agents:welcome"
+CS_T_AGENTS="claude-spaces-agents:agents"
 
 # ── tmux wrapper ─────────────────────────────────
 _tmux() {
@@ -213,7 +213,7 @@ cs_load_config() {
 
 cs_create_default_config() {
   cat > "${CONFIG_FILE}" << 'EOF'
-# claude-agents configuration
+# claude-spaces-agents configuration
 # Uncomment and modify values to override defaults.
 
 # Picker pane width: characters (e.g. 30) or percentage (e.g. 20%)
@@ -232,9 +232,9 @@ cs_create_default_config() {
 # Path to tmux.conf to source on dedicated server (empty = don't source)
 # tmux_conf=~/.tmux.conf
 
-# Directory for runtime state. Defaults to $XDG_RUNTIME_DIR/claude-agents, or
-# /tmp/claude-agents-$UID when that is unset. Must be an absolute path (~/ is expanded).
-# state_root=~/.local/state/claude-agents
+# Directory for runtime state. Defaults to $XDG_RUNTIME_DIR/claude-spaces-agents, or
+# /tmp/claude-spaces-agents-$UID when that is unset. Must be an absolute path (~/ is expanded).
+# state_root=~/.local/state/claude-spaces-agents
 
 # Seconds between refreshes of the session list. Each one runs `claude agents --json`.
 # poll_interval=2
@@ -377,7 +377,7 @@ cs_preflight_claude() {
   ver=$(cs_claude --version 2>/dev/null) || ver=""
   ver="${ver%% *}"
   if ! cs_version_ge "${ver}" "${CS_MIN_CLAUDE}"; then
-    echo "ERROR: claude-agents needs Claude Code ${CS_MIN_CLAUDE} or newer (found '${ver:-unknown}')."
+    echo "ERROR: claude-spaces-agents needs Claude Code ${CS_MIN_CLAUDE} or newer (found '${ver:-unknown}')."
     return 1
   fi
   if ! out=$(cs_claude agents --json 2>&1 >/dev/null); then
@@ -1452,8 +1452,8 @@ cs_client_write_scripts() {
     echo "printf '\\033]2;%s\\033\\\\' '${CS_T_WELCOME}'"
     echo 'clear'
     echo 'echo ""'
-    echo 'echo "  claude-agents"'
-    echo 'echo "  ─────────────────"'
+    echo 'echo "  claude-spaces-agents"'
+    echo 'echo "  ────────────────────"'
     local _wname="${PROJECT_NAMES[${PWD_SANITIZED}]:-${DISPLAY_NAMES[${PWD}]:-${PWD##*/}}}"
     printf 'echo %q\n' "  Project: ${_wname} (${PWD})"
     echo 'echo ""'
@@ -1876,7 +1876,7 @@ cs_slot_for() {
   slot=$(_tmux new-window -d -P -F '#{pane_id}' "${CS_SLEEP_CMD}" 2>/dev/null) || return 1
   [[ -n "${slot}" ]] || return 1
   # An untagged placeholder is invisible to cs_slot_sweep — never leave one.
-  if ! _tmux set -p -t "${slot}" @ca_placeholder 1 \; \
+  if ! _tmux set -p -t "${slot}" @csa_placeholder 1 \; \
              resize-window -t "${slot}" -x "${PANE_W[${tp}]}" -y "${PANE_H[${tp}]}" 2>/dev/null; then
     _tmux kill-pane -t "${slot}" 2>/dev/null || true
     return 1
@@ -1902,7 +1902,7 @@ cs_slot_sweep() {
       wtag["${wid}"]=$(( ${wtag["${wid}"]:-0} + 1 ))
       wrep["${wid}"]="${pid}"
     fi
-  done < <(_tmux list-panes -a -F '#{window_id} #{pane_id} #{?@ca_placeholder,1,0}' 2>/dev/null)
+  done < <(_tmux list-panes -a -F '#{window_id} #{pane_id} #{?@csa_placeholder,1,0}' 2>/dev/null)
   for wid in "${!wtot[@]}"; do
     (( wtot["${wid}"] == ${wtag["${wid}"]:-0} )) || continue
     [[ -n "${wrep["${wid}"]:-}" ]] || continue
@@ -1921,7 +1921,7 @@ cs_term_park() {
     cs_slot_discard "${slot}"
     return 1
   fi
-  cs_rename_pane_window "${tp}" "ca:term"
+  cs_rename_pane_window "${tp}" "csa:term"
 }
 
 # Park whatever terminal is in the main window. Call it when no client is
@@ -2175,7 +2175,7 @@ cs_switch_chain() {
     return 1
   fi
   if [[ -n "${out_tp}" ]]; then
-    cs_rename_pane_window "${out_tp}" "ca:term"
+    cs_rename_pane_window "${out_tp}" "csa:term"
   fi
   return 0
 }
@@ -2730,7 +2730,7 @@ cs_picker_render() {
     else
       printf '\e[%d;1H\e[K' "$((quit_line + 1))"
     fi
-    cs_print_centered "${version_line}" "claude-agents v${VERSION}" "${width}"
+    cs_print_centered "${version_line}" "spaces-agents v${VERSION}" "${width}"
 
     # Clear everything below
     printf '\e[%d;1H\e[J' "$((version_line + 1))"
@@ -2753,7 +2753,7 @@ cs_picker_loop() {
   PICKER_PANE=$(_tmux display-message -p '#{pane_id}')
   WINCH_PENDING=0
   trap 'WINCH_PENDING=1' WINCH
-  cs_rename_pane_window "${PICKER_PANE}" "ca:picker"
+  cs_rename_pane_window "${PICKER_PANE}" "csa:picker"
   echo "${PICKER_PANE}" > "${STATE_DIR}/picker_pane"
   echo $$ > "${STATE_DIR}/picker_pid"
 
@@ -3332,18 +3332,18 @@ cs_launch() {
     fi
 
     local session_name
-    session_name="ca$(cs_sanitize_path "${PWD}")"
+    session_name="csa$(cs_sanitize_path "${PWD}")"
 
     # A live server built by another version can't run this picker. Say so, but never
-    # kill it from under the user just because they ran claude-agents.
+    # kill it from under the user just because they ran claude-spaces-agents.
     if _tmux has-session 2>/dev/null \
        && [[ "$(cs_read_state compat_version)" != "${CS_COMPAT_VERSION}" ]]; then
       echo
-      echo "  claude-agents was updated, but the running view still uses the old layout —"
+      echo "  claude-spaces-agents was updated, but the running view still uses the old layout —"
       echo "  you're on the previous version until it restarts."
       echo
       echo "    press  prefix+R            (inside the view), or"
-      echo "    run    claude-agents --restart"
+      echo "    run    claude-spaces-agents --restart"
       echo
       echo "  Either restarts the view. Sessions keep running; open terminals close."
       echo
@@ -3375,8 +3375,8 @@ cs_launch() {
     # terminal back and the message survives in scrollback.
     if [[ -f "${STATE_DIR}/restart_required" ]]; then
       rm -f "${STATE_DIR}/restart_required"
-      echo "claude-agents was updated and the layout changed, so the view was closed."
-      echo "Run claude-agents again — your sessions kept running."
+      echo "claude-spaces-agents was updated and the layout changed, so the view was closed."
+      echo "Run claude-spaces-agents again — your sessions kept running."
       break
     fi
 
@@ -3404,13 +3404,13 @@ cs_launch() {
 cs_preflight
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-  echo "claude-agents v${VERSION} — tmux picker for Claude Code background sessions"
+  echo "claude-spaces-agents v${VERSION} — tmux picker for Claude Code background sessions"
   echo ""
   echo "Usage:"
-  echo "  claude-agents            Launch picker"
-  echo "  claude-agents --reset    Close the view, clear its state (sessions keep running)"
-  echo "  claude-agents --restart  Reset and relaunch"
-  echo "  claude-agents --help     Show this help"
+  echo "  claude-spaces-agents            Launch picker"
+  echo "  claude-spaces-agents --reset    Close the view, clear its state (sessions keep running)"
+  echo "  claude-spaces-agents --restart  Reset and relaunch"
+  echo "  claude-spaces-agents --help     Show this help"
   echo ""
   cs_help_text
   echo ""

@@ -1,29 +1,30 @@
-# claude-agents
+# claude-spaces-agents
 
 A tmux picker for Claude Code **background sessions** ("agents"). Sibling of claude-spaces.
 
-Status: prototype. Implemented in `claude-agents`, tested by `run_tests_agents` and
-`run_breaks_agents` (§ Testing). Developed against Claude Code 2.1.325, where agent view is a
+Status: prototype. Implemented in `claude-spaces-agents`, tested by `run_tests` and
+`run_breaks` (§ Testing). Developed against Claude Code 2.1.325, where agent view is a
 research preview ("The interface and keyboard shortcuts may change").
 
-This spec is a single self-contained file for now. Whether claude-agents stays in this repo or
-gets its own is decided after a prototype.
+The script was forked from claude-spaces (`github.com/wired/claude-spaces`) at commit `bd12ce2`
+(0.9.12-dev). Wherever this spec says "as in claude-spaces" or "unchanged from claude-spaces",
+that commit is the reference.
 
 ## The shift
 
 In claude-spaces a tmux pane keeps each Claude alive, so the picker owns processes: one window per
 session, fillers, `panes/<num>`, bell hooks.
 
-With `claude --bg`, Claude's supervisor owns the processes. claude-agents owns only a **view**: a
-picker pane, one client pane, and per-session terminal panes. Killing the tmux server loses no
-session. It does kill the terminals and whatever runs in them.
+With `claude --bg`, Claude's supervisor owns the processes. claude-spaces-agents owns only a
+**view**: a picker pane, one client pane, and per-session terminal panes. Killing the tmux server
+loses no session. It does kill the terminals and whatever runs in them.
 
 ## Decisions
 
 | Decision | Why |
 |---|---|
-| Separate script `claude-agents`, forked from claude-spaces | The change replaces the core layers (pane lifecycle, discovery, bells), not the edges. A mode flag would branch all of them and double the test matrix. It also keeps a research-preview dependency out of claude-spaces. |
-| Agents-only list | Source of truth is `claude agents --json --all`, background entries only. Interactive sessions are not listed. No transcript scan, no name resolution, no hidden list. Older conversations are reached with `/resume` in agent view. |
+| Separate script `claude-spaces-agents`, forked from claude-spaces | The change replaces the core layers (pane lifecycle, discovery, bells), not the edges. A mode flag would branch all of them and double the test matrix. It also keeps a research-preview dependency out of claude-spaces. |
+| Its own repository | The two tools have separate versions, and tags belong to a repository, not to a script. In one repository every claude-spaces release tarball would also carry this script. Functions keep the `cs_` prefix and variables `CS_`, so fixes port between the two scripts by hand. || Agents-only list | Source of truth is `claude agents --json --all`, background entries only. Interactive sessions are not listed. No transcript scan, no name resolution, no hidden list. Older conversations are reached with `/resume` in agent view. |
 | One tmux server per project | Same as claude-spaces: launcher, server naming and state layout carry over, new sessions start in `$PWD`, and two terminals on two projects stay independent. A single global server would mirror every attached terminal. |
 | One client pane per server | The pane runs `claude attach <id>`; switching respawns it. No per-session Claude windows and no picker fillers. |
 | `←` stays enabled | It cannot be disabled for an attached client without disabling the feature. The picker follows what the client shows instead. |
@@ -103,7 +104,7 @@ already depends on the same format for session names.
 `CLAUDE_CODE_DISABLE_AGENT_VIEW=1` disables `claude agents`, `--bg`, `attach` and the supervisor
 (`'attach' is disabled by CLAUDE_CODE_DISABLE_AGENT_VIEW.`). `0` and `false` leave them on.
 
-claude-agents exports `CLAUDE_CODE_DISABLE_AGENT_VIEW=0` at the top of the script, before the
+claude-spaces-agents exports `CLAUDE_CODE_DISABLE_AGENT_VIEW=0` at the top of the script, before the
 preflight. The launcher, the picker, the tmux server it starts and every pane inherit it, even
 when the tool was started from a shell that had `1`.
 
@@ -122,7 +123,7 @@ those commands only, never in the claude-spaces server environment.
 ## Topology
 
 One window: `[client (+ terminal) | picker]`. The picker is `PICKER_WIDTH` wide on the configured
-side. A terminal that is not in the main window is parked in a hidden `ca:term` window, pinned to
+side. A terminal that is not in the main window is parked in a hidden `csa:term` window, pinned to
 the size it has when shown (§ Terminals).
 
 The client pane is created once and lives as long as the server. Its ID is stored in
@@ -373,7 +374,8 @@ changes directory, initializes the target's state, and only then writes `pending
 it earlier would lose it: state initialization wipes the directory of a server that is not
 running.
 
-There is no inactive section. To work in a folder that has no sessions, run `claude-agents` there.
+There is no inactive section. To work in a folder that has no sessions, run
+`claude-spaces-agents` there.
 
 ## Actions
 
@@ -456,7 +458,7 @@ Further rules:
 
 ### Parking
 
-Parking never resizes a terminal. It sits in a hidden `ca:term` window pinned to the terminal's
+Parking never resizes a terminal. It sits in a hidden `csa:term` window pinned to the terminal's
 own size, and it only moves between cells of that size.
 
 Park:
@@ -488,7 +490,7 @@ _tmux join-pane -d -s "$TERM_PANE" -t "$CLIENT" -l <size>
   stale and is computed from the setting or the saved share.
 - A fixed-size terminal that a resize hides was squeezed by tmux first. Its record is dropped,
   so reopening it computes the size again, and marks it `.keep` when there is no room.
-- Placeholders are tagged with the pane option `@ca_placeholder`. At startup and after a failed
+- Placeholders are tagged with the pane option `@csa_placeholder`. At startup and after a failed
   switch the picker kills any window whose only pane is a tagged placeholder, so a slot left
   behind by a failed chain does not stay forever.
 - Hiding or showing the terminal of the displayed session changes the client pane's size while a
@@ -509,11 +511,12 @@ The launcher follows the claude-spaces design. Each project gets its own tmux se
 `$PWD`. The launcher creates it if missing and attaches. When the picker leaves a `switch_target`
 and detaches, the launcher changes to that directory and loops (§ Other projects).
 
-State lives in `${XDG_RUNTIME_DIR}/claude-agents/<sanitized-cwd>/`, or under
-`/tmp/claude-agents-${UID}/` when `XDG_RUNTIME_DIR` is unset.
+State lives in `${XDG_RUNTIME_DIR}/claude-spaces-agents/<sanitized-cwd>/`, or under
+`/tmp/claude-spaces-agents-${UID}/` when `XDG_RUNTIME_DIR` is unset.
 
-- Server names use the prefix `ca`, state root and config use `claude-agents`, so both tools can
-  run on the same project.
+- Server names use the prefix `csa`, state root and config use `claude-spaces-agents`, so both
+  tools can run on the same project. The prefix must never start with `cs-`: claude-spaces finds
+  its own servers by globbing sockets named `cs-*`, and would take these for its own.
 - Preflight runs only when the launcher is about to create a server, not on a re-attach, and
   after the export in § Environment: `claude --version` is at least 2.1.325, the only version
   tested, and `claude agents --json` exits 0. Otherwise print Claude's own message and exit.
@@ -551,9 +554,9 @@ Persistent files, respecting `$XDG_CONFIG_HOME` and `$XDG_DATA_HOME`:
 
 | File | Purpose |
 |---|---|
-| `~/.config/claude-agents/config` | configuration (see § Open questions) |
-| `~/.local/share/claude-agents/project_names` | custom project names |
-| `~/.local/share/claude-agents/seen/<id>` | empty file; its mtime is when the session was last shown |
+| `~/.config/claude-spaces-agents/config` | configuration (see § Open questions) |
+| `~/.local/share/claude-spaces-agents/project_names` | custom project names |
+| `~/.local/share/claude-spaces-agents/seen/<id>` | empty file; its mtime is when the session was last shown |
 
 ## Polling
 
@@ -626,7 +629,7 @@ to the entrypoint marker. Claude is replaced by a fake `claude` on `PATH`:
 
 Terminals run a shell stand-in that records the directory it started in and every SIGWINCH.
 
-`run_tests_agents` runs everything; `run_tests_agents <test_name>` runs one test.
+`run_tests` runs everything; `run_tests <test_name>` runs one test.
 
 **After every test** a check looks at what is left: the panes, the windows and the state files.
 
@@ -652,8 +655,8 @@ to move.
 a scratch `HOME`: launch, detach, re-attach, the prefix table, the preflight, the compatibility
 gate, a hop to another project, and parking a terminal with a real client attached.
 
-**Every test has been seen failing.** `run_breaks_agents` holds one or more breaks per test:
-lines of `claude-agents` to damage and the tests that must go red. It applies each to a copy,
+**Every test has been seen failing.** `run_breaks` holds one or more breaks per test:
+lines of `claude-spaces-agents` to damage and the tests that must go red. It applies each to a copy,
 runs those tests, and reports any that stay green, any break whose lines are no longer in the
 script, and any test no break names. A few breaks damage the test file instead, for the check
 that runs after every test.
@@ -694,6 +697,4 @@ Not verified:
 
 - **Retention.** How long finished rows stay in `--all` is undocumented.
 - **Config.** Own file with the claude-spaces keys, or read the claude-spaces config.
-- **Repository.** This repo or its own; decided after the prototype. Packaging, versioning, and
-  whether functions keep the `cs_` prefix so fixes port between the scripts all follow from it.
 - **Keys.** The assignments in § Actions are proposals.

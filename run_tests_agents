@@ -1,0 +1,2822 @@
+#!/usr/bin/env bash
+# ══════════════════════════════════════════════════
+# claude-agents tests
+#
+#   run_tests_agents               lint, then every test
+#   run_tests_agents <test_name>   that one test only, no lint
+#
+# Same approach as run_tests: an isolated tmux server and the script's functions
+# evaluated up to its entrypoint. Claude is a fake `claude` on PATH, so no real
+# session is ever started. The launcher tests run the real script in a terminal:
+# a pane of a second, outer tmux server.
+#
+# After every test an invariant check looks at the panes, windows and state
+# files that are left (ca_assert_consistent).
+# ══════════════════════════════════════════════════
+
+# Re-exec under bash 4.3+ on macOS if needed
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
+  for _bash in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    [[ -x "$_bash" ]] && exec "$_bash" "$0" "$@"
+  done
+  echo "ERROR: bash 4.3+ required (found ${BASH_VERSION})."
+  exit 1
+fi
+
+SCRIPT_UNDER_TEST="${SCRIPT_UNDER_TEST:-$(dirname "$(readlink -f "$0")")/claude-agents}"
+SCRIPT_UNDER_TEST=$(readlink -f "${SCRIPT_UNDER_TEST}")
+ONLY="${1:-}"
+
+RED='\033[31m'
+GREEN='\033[32m'
+RESET='\033[0m'
+
+PASS_COUNT=0
+FAIL_COUNT=0
+
+# ── Lint ─────────────────────────────────────────
+phase_shellcheck() {
+  echo "Running shellcheck..."
+  if ! shellcheck -S warning "${SCRIPT_UNDER_TEST}"; then
+    echo -e "${RED}shellcheck failed${RESET}"
+    exit 1
+  fi
+  echo -e "${GREEN}shellcheck passed${RESET}"
+  echo ""
+}
+
+phase_arg_checks() {
+  echo "Running arg checks..."
+  local errors=0
+  for func_sig in "cs_entry_append:7" "cs_entry_prepend:7"; do
+    local func="${func_sig%%:*}"
+    local expected="${func_sig##*:}"
+    while IFS=: read -r linenum content; do
+      local count
+      count=$(echo "${content}" | grep -o '"' | wc -l)
+      count=$((count / 2))
+      if ((count != expected)); then
+        echo -e "  ${RED}Line ${linenum}: ${func} has ${count} args (expected ${expected})${RESET}"
+        ((errors++))
+      fi
+    done < <(grep -n "${func} " "${SCRIPT_UNDER_TEST}" | grep -v '^\s*#' | grep -v "${func}()" | grep -v "${func}() {" | grep -v "echo.*${func}")
+  done
+  if ((errors > 0)); then
+    echo -e "${RED}arg checks failed${RESET}"
+    exit 1
+  fi
+  echo -e "${GREEN}arg checks passed${RESET}"
+  echo ""
+}
+
+# ── Source functions ──────────────────────────────
+load_functions() {
+  eval "$(sed -n '1,/^# ── Entrypoint/p' "${SCRIPT_UNDER_TEST}" | sed '$d')"
+}
+
+# ── Fake claude ──────────────────────────────────
+# State lives in $FAKE_CLAUDE_DIR:
+#   list.json      what `agents --json` prints
+#   fail           present: `agents --json` fails
+#   pending.json   a dispatched session, listed after `delay` more polls
+#   quiet          present: `--bg` prints no id
+#   untrusted      present: `--bg` refuses, as in a directory never opened before
+#   slow_agents    present: agent view takes two seconds to set its title
+#   attach.log     one line per `attach <id>` / `agents`
+#   attach.pid     pid of the last fake client
+#   cmd.log        one line per --bg / stop / rm
+#   winch.<id>     one line per SIGWINCH a fake client received
+write_fake_claude() {
+  cat > "$1" << 'FAKE'
+#!/usr/bin/env bash
+D="${FAKE_CLAUDE_DIR:?}"
+list="${D}/list.json"
+case "${1:-}" in
+  --version)
+    echo "2.1.325 (Claude Code)"
+    ;;
+  agents)
+    if [[ "${2:-}" == "--json" ]]; then
+      if [[ -f "${D}/fail" ]]; then
+        echo "simulated failure" >&2
+        exit 1
+      fi
+      if [[ -f "${D}/pending.json" ]]; then
+        left=$(cat "${D}/delay" 2>/dev/null || echo 0)
+        if ((left <= 0)); then
+          jq -s '.[0] + .[1]' "${list}" "${D}/pending.json" > "${list}.tmp" && mv "${list}.tmp" "${list}"
+          rm -f "${D}/pending.json"
+        else
+          echo $((left - 1)) > "${D}/delay"
+        fi
+      fi
+      cat "${list}"
+    else
+      echo "agents" >> "${D}/attach.log"
+      echo $$ > "${D}/attach.pid"
+      [[ -f "${D}/slow_agents" ]] && sleep 2
+      printf '\033]2;%s\033\\' "claude agents"
+      while :; do
+        sleep 0.2
+      done
+    fi
+    ;;
+  attach)
+    # Like the real one: sets no title.
+    echo "${2:-}" >> "${D}/attach.log"
+    echo $$ > "${D}/attach.pid"
+    trap 'echo WINCH >> "${D}/winch.${2:-}"' WINCH
+    while :; do
+      sleep 0.2
+    done
+    ;;
+  --bg)
+    echo "bg $*" >> "${D}/cmd.log"
+    if [[ -f "${D}/untrusted" ]]; then
+      echo "Workspace not trusted: open this directory in Claude Code once." >&2
+      exit 1
+    fi
+    n=$(cat "${D}/counter" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    echo "${n}" > "${D}/counter"
+    id=$(printf 'f%07x' "${n}")
+    jq -n --arg id "${id}" --arg cwd "${PWD}" \
+      '[{id: $id, kind: "background", cwd: $cwd, state: "blocked", status: "idle",
+         sessionId: ($id + "-0000-4000-8000-000000000000"), name: $id,
+         startedAt: 1700000000000, pid: 4242}]' > "${D}/pending.json"
+    if [[ -f "${D}/quiet" ]]; then
+      echo "backgrounded"
+    else
+      echo "backgrounded · ${id} (idle — send a prompt to start)"
+    fi
+    ;;
+  stop)
+    echo "stop ${2:-}" >> "${D}/cmd.log"
+    jq --arg id "${2:-}" 'map(if .id == $id then del(.pid, .status) else . end)' "${list}" > "${list}.tmp" && mv "${list}.tmp" "${list}"
+    echo "stopped ${2:-}"
+    ;;
+  rm)
+    echo "rm ${2:-}" >> "${D}/cmd.log"
+    jq --arg id "${2:-}" 'map(select(.id != $id))' "${list}" > "${list}.tmp" && mv "${list}.tmp" "${list}"
+    echo "removed ${2:-}"
+    ;;
+esac
+FAKE
+  chmod +x "$1"
+}
+
+# Stand-in for the user's shell in a terminal pane. Records the directory it
+# started in and every SIGWINCH it receives, under the pane's number.
+write_fake_shell() {
+  cat > "$1" << 'FAKE'
+#!/usr/bin/env bash
+D="${FAKE_CLAUDE_DIR:?}"
+n="${TMUX_PANE#%}"
+pwd > "${D}/termcwd.${n}"
+trap 'echo WINCH >> "${D}/termwinch.${n}"' WINCH
+while :; do
+  sleep 0.2
+done
+FAKE
+  chmod +x "$1"
+}
+
+# ── Fixtures ─────────────────────────────────────
+# fake_add <id> <state> <status> <name> [cwd] [kind]
+fake_add() {
+  local id="$1" state="$2" status="$3" name="$4" cwd="${5:-${PWD}}" kind="${6:-background}"
+  local list="${FAKE_CLAUDE_DIR}/list.json"
+  jq --arg id "${id}" --arg state "${state}" --arg status "${status}" --arg name "${name}" \
+     --arg cwd "${cwd}" --arg kind "${kind}" \
+    '. + [({id: $id, kind: $kind, cwd: $cwd, state: $state,
+            sessionId: ($id + "-0000-4000-8000-000000000000"), name: $name,
+            startedAt: 1700000000000}
+           + (if $status == "" then {} else {status: $status, pid: 4242} end))]' \
+    "${list}" > "${list}.tmp" && mv "${list}.tmp" "${list}"
+}
+
+# fake_set <id> <state> <status>
+fake_set() {
+  local list="${FAKE_CLAUDE_DIR}/list.json"
+  jq --arg id "$1" --arg state "$2" --arg status "$3" \
+    'map(if .id == $id then .state = $state | .status = $status else . end)' \
+    "${list}" > "${list}.tmp" && mv "${list}.tmp" "${list}"
+}
+
+# fake_drop <id> — as if it had been removed somewhere else
+fake_drop() {
+  local list="${FAKE_CLAUDE_DIR}/list.json"
+  jq --arg id "$1" 'map(select(.id != $id))' "${list}" > "${list}.tmp" && mv "${list}.tmp" "${list}"
+}
+
+iso_at() {
+  date -u -d "@$1" '+%Y-%m-%dT%H:%M:%S.123Z'
+}
+
+transcript_of() {
+  echo "${PROJECTS_DIR}/proj/$1-0000-4000-8000-000000000000.jsonl"
+}
+
+# fake_transcript <id> <epoch the last turn ended>
+fake_transcript() {
+  local f
+  f=$(transcript_of "$1")
+  {
+    echo '{"type":"mode","sessionId":"x"}'
+    echo "{\"type\":\"user\",\"timestamp\":\"$(iso_at $(($2 - 5)))\"}"
+    echo "{\"type\":\"assistant\",\"timestamp\":\"$(iso_at $(($2 - 1)))\"}"
+    echo "{\"type\":\"system\",\"subtype\":\"turn_duration\",\"timestamp\":\"$(iso_at "$2")\"}"
+  } > "${f}"
+}
+
+# What Claude appends when a process stops, restarts or is attached after a
+# while: records with no timestamp, and an away_summary that has one.
+fake_housekeeping() {
+  local f
+  f=$(transcript_of "$1")
+  {
+    echo '{"type":"cost-state"}'
+    echo '{"type":"last-prompt"}'
+    echo "{\"type\":\"system\",\"subtype\":\"away_summary\",\"timestamp\":\"$(iso_at "$(date +%s)")\"}"
+    echo '{"type":"ai-title"}'
+  } >> "${f}"
+}
+
+# seen_at <id> <epoch>
+seen_at() {
+  touch -d "@$2" "${SEEN_DIR}/$1"
+}
+
+# ── Test helpers ─────────────────────────────────
+fail() {
+  echo -e "    ${RED}FAIL${RESET} $*"
+  return 1
+}
+
+# assert_eq <label> <actual> <expected>
+assert_eq() {
+  if [[ "$2" != "$3" ]]; then
+    fail "$1: got '$2', expected '$3'"
+    return 1
+  fi
+}
+
+client_title() {
+  _tmux display-message -p -t "${CLIENT_PANE}" '#{pane_title}'
+}
+
+set_client_title() {
+  _tmux select-pane -t "${CLIENT_PANE}" -T "$1"
+}
+
+pane_pid() {
+  _tmux display-message -p -t "$1" '#{pane_pid}'
+}
+
+pane_size() {
+  _tmux display-message -p -t "$1" '#{pane_width}x#{pane_height}'
+}
+
+pane_window() {
+  _tmux display-message -p -t "$1" '#{window_id}'
+}
+
+# True when pane $1 sits in the picker's window.
+in_main() {
+  [[ "$(pane_window "$1")" == "$(pane_window "${PICKER_PANE}")" ]]
+}
+
+pane_is_alive() {
+  cs_refresh_pane_cache
+  cs_pane_alive "$1"
+}
+
+term_pane_of() {
+  cat "${STATE_DIR}/term/$1" 2>/dev/null
+}
+
+# How many SIGWINCH the terminal in pane $1 has received.
+term_winch() {
+  local f="${FAKE_CLAUDE_DIR}/termwinch.${1#%}"
+  if [[ -f "${f}" ]]; then
+    wc -l < "${f}" | tr -d ' '
+  else
+    echo 0
+  fi
+}
+
+# How many SIGWINCH the fake clients attached to session $1 have received.
+client_winch() {
+  local f="${FAKE_CLAUDE_DIR}/winch.$1"
+  if [[ -f "${f}" ]]; then
+    wc -l < "${f}" | tr -d ' '
+  else
+    echo 0
+  fi
+}
+
+# Long enough for a stand-in sleeping 0.2 s at a time to run its trap.
+settle() {
+  sleep 0.6
+}
+
+# One scan's worth of looking at the client pane.
+look() {
+  cs_refresh_pane_cache
+  cs_follow
+}
+
+# wait_for <file> — until it exists and is not empty, two seconds at most
+wait_for() {
+  local i
+  for ((i = 0; i < 40; i++)); do
+    [[ -s "$1" ]] && return 0
+    sleep 0.05
+  done
+  return 1
+}
+
+# Draw the picker at $1 columns by $2 rows on a real tmux pane and print what
+# that screen then shows, one line per row. With "colors" as $3 the colour
+# sequences are kept. tput is told the size through the environment, and bash is
+# kept from putting the real terminal's size back there.
+screen_of_render() {
+  local cols="$1" rows="$2" pane tty out
+  pane=$(_tmux new-window -d -P -F '#{pane_id}' "sleep 99999")
+  _tmux resize-window -t "${pane}" -x "${cols}" -y "${rows}"
+  tty=$(_tmux display-message -p -t "${pane}" '#{pane_tty}')
+  out=$(shopt -u checkwinsize; export COLUMNS="${cols}" LINES="${rows}"; cs_picker_render)
+  printf '%s' "${out}" > "${tty}"
+  sleep 0.2
+  if [[ "${3:-}" == "colors" ]]; then
+    _tmux capture-pane -e -p -t "${pane}"
+  else
+    _tmux capture-pane -p -t "${pane}"
+  fi
+  _tmux kill-pane -t "${pane}"
+}
+
+# The same, into the array `row`, numbered like the screen: row[1] is the top.
+screen_rows() {
+  mapfile -t row < <(screen_of_render "$@")
+  row=("" "${row[@]}")
+}
+
+# $1 as cs_print_centered puts it on a line 40 columns wide.
+centered40() {
+  printf '%*s%s' "$(( (40 - ${#1}) / 2 ))" "" "$1"
+}
+
+# Show session $1 and open its terminal in orientation $2, then let it settle.
+show_with_terminal() {
+  cs_show_session "$1" || return 1
+  cs_term_smart "${2:-bottom}"
+  local tp
+  tp=$(term_pane_of "$1")
+  [[ -n "${tp}" ]] || return 1
+  wait_for "${FAKE_CLAUDE_DIR}/termcwd.${tp#%}"
+}
+
+# ── State invariant checker ──────────────────────
+# What must hold whenever the picker is idle, whatever the test did.
+ca_assert_consistent() {
+  local label="$1" errors=0
+  local pp cp displayed
+  pp=$(cat "${STATE_DIR}/picker_pane" 2>/dev/null)
+  cp=$(cat "${STATE_DIR}/client_pane" 2>/dev/null)
+  displayed=$(cat "${STATE_DIR}/displayed" 2>/dev/null)
+
+  local -A win tagged
+  local p w t
+  while read -r p w t; do
+    [[ -n "${p}" ]] || continue
+    win["${p}"]="${w}"
+    tagged["${p}"]="${t}"
+  done < <(_tmux list-panes -a -F '#{pane_id} #{window_id} #{?@ca_placeholder,1,0}' 2>/dev/null)
+
+  # 1. the picker pane is alive and was never respawned
+  if [[ -z "${pp}" || -z "${win[${pp}]:-}" ]]; then
+    echo -e "    ${RED}FAIL${RESET} [${label}] picker pane '${pp}' is gone"
+    return 1
+  fi
+  if [[ "$(pane_pid "${pp}")" != "${PICKER_PID0}" ]]; then
+    echo -e "    ${RED}FAIL${RESET} [${label}] the picker pane was respawned"
+    ((errors++))
+  fi
+
+  # 2. exactly one client pane, alive, beside the picker
+  if [[ -z "${cp}" || -z "${win[${cp}]:-}" ]]; then
+    echo -e "    ${RED}FAIL${RESET} [${label}] client pane '${cp}' is gone"
+    ((errors++))
+  elif [[ "${win[${cp}]}" != "${win[${pp}]}" || "${cp}" == "${pp}" ]]; then
+    echo -e "    ${RED}FAIL${RESET} [${label}] client pane '${cp}' is not beside the picker"
+    ((errors++))
+  fi
+
+  # 3. no placeholder is left anywhere
+  for p in "${!tagged[@]}"; do
+    if [[ "${tagged[${p}]}" == "1" ]]; then
+      echo -e "    ${RED}FAIL${RESET} [${label}] placeholder pane ${p} left behind"
+      ((errors++))
+    fi
+  done
+
+  # 4. terminals: every one tracked is alive; at most one is in the main window,
+  #    and it belongs to the displayed session
+  local -A tracked
+  local f id tp in_main_count=0
+  for f in "${STATE_DIR}"/term/*; do
+    [[ -f "${f}" ]] || continue
+    id="${f##*/}"
+    if [[ "${id}" == *.shown ]]; then
+      if [[ ! -f "${f%.shown}" ]]; then
+        echo -e "    ${RED}FAIL${RESET} [${label}] term/${id} exists but the terminal does not"
+        ((errors++))
+      fi
+      continue
+    fi
+    [[ "${id}" == *.* ]] && continue
+    tp=$(cat "${f}" 2>/dev/null)
+    if [[ -z "${tp}" || -z "${win[${tp}]:-}" ]]; then
+      echo -e "    ${RED}FAIL${RESET} [${label}] term/${id} references dead pane '${tp}'"
+      ((errors++))
+      continue
+    fi
+    tracked["${tp}"]="${id}"
+    if [[ "${win[${tp}]}" == "${win[${pp}]}" ]]; then
+      ((in_main_count++))
+      if [[ "${id}" != "${displayed}" ]]; then
+        echo -e "    ${RED}FAIL${RESET} [${label}] terminal of '${id}' is in the main window but '${displayed}' is displayed"
+        ((errors++))
+      fi
+      if [[ ! -f "${f}.shown" ]]; then
+        echo -e "    ${RED}FAIL${RESET} [${label}] terminal of '${id}' is in the main window but is marked hidden"
+        ((errors++))
+      fi
+    fi
+  done
+  if ((in_main_count > 1)); then
+    echo -e "    ${RED}FAIL${RESET} [${label}] ${in_main_count} terminals in the main window"
+    ((errors++))
+  fi
+
+  # 5. the displayed session's terminal, when marked shown, is in the main window
+  if [[ -n "${displayed}" && -f "${STATE_DIR}/term/${displayed}.shown" ]]; then
+    tp=$(cat "${STATE_DIR}/term/${displayed}" 2>/dev/null)
+    if [[ -n "${tp}" && -n "${win[${tp}]:-}" && "${win[${tp}]}" != "${win[${pp}]}" ]]; then
+      echo -e "    ${RED}FAIL${RESET} [${label}] terminal of the displayed session is parked"
+      ((errors++))
+    fi
+  fi
+
+  # 6. the main window holds the picker, the client, and that one terminal at most
+  local main_panes=0
+  for p in "${!win[@]}"; do
+    [[ "${win[${p}]}" == "${win[${pp}]}" ]] && ((main_panes++))
+  done
+  if ((main_panes != 2 + in_main_count)); then
+    echo -e "    ${RED}FAIL${RESET} [${label}] main window has ${main_panes} panes (expected $((2 + in_main_count)))"
+    ((errors++))
+  fi
+
+  # 7. every other pane is a tracked, parked terminal alone in its window
+  local -A per_window
+  for p in "${!win[@]}"; do
+    per_window["${win[${p}]}"]=$(( ${per_window["${win[${p}]}"]:-0} + 1 ))
+  done
+  for p in "${!win[@]}"; do
+    [[ "${win[${p}]}" == "${win[${pp}]}" ]] && continue
+    if [[ -z "${tracked[${p}]:-}" ]]; then
+      echo -e "    ${RED}FAIL${RESET} [${label}] untracked pane ${p} in window ${win[${p}]}"
+      ((errors++))
+    elif ((per_window["${win[${p}]}"] != 1)); then
+      echo -e "    ${RED}FAIL${RESET} [${label}] parked terminal ${p} shares its window"
+      ((errors++))
+    fi
+  done
+
+  return "${errors}"
+}
+
+# ── Launcher harness ─────────────────────────────
+# The real script, launched in a terminal: a pane of an outer tmux server, with
+# a scratch HOME. Projects are ${TEST_TMP}/e2e/a and /b.
+e2e_project() {
+  echo "${TEST_TMP}/e2e/$1"
+}
+
+e2e_inner() {
+  cs_server_name "$(e2e_project "$1")"
+}
+
+e2e_state() {
+  echo "${TEST_TMP}/e2e/run/claude-agents/$(cs_sanitize_path "$(e2e_project "$1")")"
+}
+
+e2e_cleanup() {
+  local sockdir p
+  sockdir="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"
+  tmux -L "${E2E_OUTER}" kill-server 2>/dev/null
+  rm -f "${sockdir}/${E2E_OUTER}"
+  for p in a b; do
+    tmux -L "$(e2e_inner "${p}")" kill-server 2>/dev/null
+    rm -f "${sockdir}/$(e2e_inner "${p}")"
+  done
+  rm -rf "${TEST_TMP}/e2e"
+}
+
+# e2e_launch <project> — start the launcher there, in the outer server's pane
+e2e_launch() {
+  mkdir -p "${TEST_TMP}/e2e/home" "${TEST_TMP}/e2e/run" "$(e2e_project a)" "$(e2e_project b)"
+  # A user's tmux.conf can turn title recording off; following depends on it.
+  echo 'set -gw allow-set-title off' > "${TEST_TMP}/e2e/home/.tmux.conf"
+  local cmd
+  cmd="cd $(e2e_project "$1") && ${SCRIPT_UNDER_TEST}; echo \"launcher exit=\$?\"; exec sleep 99999"
+  if tmux -L "${E2E_OUTER}" has-session 2>/dev/null; then
+    tmux -L "${E2E_OUTER}" respawn-pane -k -t o "${cmd}"
+  else
+    env -i HOME="${TEST_TMP}/e2e/home" USER="$(id -un)" LANG="${LANG:-C.UTF-8}" TERM=xterm-256color \
+      SHELL=/bin/bash PATH="${PATH}" XDG_RUNTIME_DIR="${TEST_TMP}/e2e/run" \
+      FAKE_CLAUDE_DIR="${FAKE_CLAUDE_DIR}" \
+      tmux -L "${E2E_OUTER}" -f /dev/null new-session -d -s o -x 150 -y 40 "${cmd}"
+  fi
+}
+
+e2e_outer_text() {
+  tmux -L "${E2E_OUTER}" capture-pane -p -t o 2>/dev/null
+}
+
+# e2e_wait_outer <text> — until the outer pane shows it, ten seconds at most
+e2e_wait_outer() {
+  local i
+  for ((i = 0; i < 100; i++)); do
+    e2e_outer_text | grep -q -- "$1" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# e2e_wait_up <project> — until that project's picker has built its window
+e2e_wait_up() {
+  local i st
+  st=$(e2e_state "$1")
+  for ((i = 0; i < 100; i++)); do
+    if [[ -s "${st}/picker_pane" && -s "${st}/client_pane" ]] \
+       && tmux -L "$(e2e_inner "$1")" has-session 2>/dev/null; then
+      sleep 0.3
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+# e2e_keys <project> <key>... — type into that project's picker
+e2e_keys() {
+  local proj="$1" k
+  shift
+  for k in "$@"; do
+    tmux -L "$(e2e_inner "${proj}")" send-keys -t "$(cat "$(e2e_state "${proj}")/picker_pane")" "${k}"
+    sleep 0.3
+  done
+}
+
+e2e_picker_text() {
+  tmux -L "$(e2e_inner "$1")" capture-pane -p -t "$(cat "$(e2e_state "$1")/picker_pane")" 2>/dev/null
+}
+
+# ── Setup / teardown ─────────────────────────────
+cs_test_setup() {
+  TEST_TMP=$(mktemp -d)
+  TEST_SESSION="ca-test-$$"
+  TMUX_SERVER="ca-test-$$"
+  E2E_OUTER="ca-test-outer-$$"
+  export TERM="${TERM:-xterm}"
+
+  mkdir -p "${TEST_TMP}/state/term" "${TEST_TMP}/state-root" "${TEST_TMP}/claude/projects/proj"
+  mkdir -p "${TEST_TMP}/config" "${TEST_TMP}/data/seen" "${TEST_TMP}/fake" "${TEST_TMP}/bin"
+  mkdir -p "${TEST_TMP}/project"
+
+  CLAUDE_DIR="${TEST_TMP}/claude"
+  PROJECTS_DIR="${CLAUDE_DIR}/projects"
+  CS_CONFIG_DIR="${TEST_TMP}/config"
+  CS_DATA_DIR="${TEST_TMP}/data"
+  CONFIG_FILE="${CS_CONFIG_DIR}/config"
+  PROJECT_NAMES_FILE="${CS_DATA_DIR}/project_names"
+  SEEN_DIR="${CS_DATA_DIR}/seen"
+  STATE_DIR="${TEST_TMP}/state"
+  CS_STATE_ROOT="${TEST_TMP}/state-root"
+  : > "${CONFIG_FILE}"
+  : > "${PROJECT_NAMES_FILE}"
+
+  PWD="${TEST_TMP}/project"
+  PWD_SANITIZED=$(cs_sanitize_path "${PWD}")
+
+  # The fake has to be what the panes run too, so it goes on PATH before the
+  # tmux server starts and inherits the environment.
+  export FAKE_CLAUDE_DIR="${TEST_TMP}/fake"
+  echo '[]' > "${FAKE_CLAUDE_DIR}/list.json"
+  write_fake_claude "${TEST_TMP}/bin/claude"
+  write_fake_shell "${TEST_TMP}/bin/termshell"
+  export PATH="${TEST_TMP}/bin:${PATH}"
+
+  POLL_INTERVAL=0
+  CS_NEW_WAIT_STEP=0.05
+
+  _tmux new-session -d -s "${TEST_SESSION}" -x 120 -y 40 "sleep 99999"
+  sleep 0.05
+  # Terminals run $SHELL. Point it at the stand-in only now: tmux takes its own
+  # default shell from the environment the server started in.
+  SHELL="${TEST_TMP}/bin/termshell"
+  PICKER_PANE=$(_tmux list-panes -t "${TEST_SESSION}" -F '#{pane_id}' | head -1)
+  PICKER_PID0=$(pane_pid "${PICKER_PANE}")
+  echo "${PICKER_PANE}" > "${STATE_DIR}/picker_pane"
+
+  SELECTED=0
+  SCROLL=0
+  DIRTY=0
+  NOW=$(date +%s)
+
+  cs_client_write_scripts
+  cs_client_ensure
+}
+
+cs_test_teardown() {
+  e2e_cleanup
+  _tmux kill-server 2>/dev/null || true
+  # tmux leaves the socket file of a server that ended
+  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/${TMUX_SERVER}"
+  rm -rf "${TEST_TMP}"
+}
+
+cs_test_reset() {
+  e2e_cleanup
+  rm -rf "${FAKE_CLAUDE_DIR}" "${SEEN_DIR}" "${PROJECTS_DIR}/proj" "${STATE_DIR}/term"
+  mkdir -p "${FAKE_CLAUDE_DIR}" "${SEEN_DIR}" "${PROJECTS_DIR}/proj" "${STATE_DIR}/term"
+  rm -rf "${PWD}/.claude"
+  echo '[]' > "${FAKE_CLAUDE_DIR}/list.json"
+  rm -f "${STATE_DIR}/displayed" "${STATE_DIR}/new_session" "${STATE_DIR}/poll.err"
+  rm -f "${STATE_DIR}/switch_target" "${STATE_DIR}/pending_load"
+  rm -f "${CS_STATE_ROOT}/agents.json"
+  : > "${CONFIG_FILE}"
+  : > "${PROJECT_NAMES_FILE}"
+
+  AG_IDS=()
+  AG_STATE=(); AG_STATUS=(); AG_SID=(); AG_CWD=(); AG_NAME=(); AG_STARTED=()
+  AG_TPATH=(); AG_TMTIME=(); AG_ACT=(); AG_ACT_SRC=()
+  SEEN_AT=(); UNSEEN_SET=(); SEEN_ABSENT=(); TERM_ABSENT=()
+  PROJECT_NAMES=()
+  REMOTE_SERVERS=()
+  OTHER_PROJECTS_KEY=""
+  POLL_ERROR=""
+  POLLED=0
+  LAST_POLL=0
+  FOOTER_MSG=""
+  DISPLAYED=""
+  SHOWN=""
+  WINDOW_FOCUSED=1
+  PICKER_WIDTH="30"
+  PICKER_SIDE="right"
+  RECENT_THRESHOLD=10
+  TERMINAL_HEIGHT="35%"
+  TERMINAL_WIDTH="45%"
+  # The 120-column test window can't fit a side terminal next to the default minimum (60)
+  MIN_CLAUDE_WIDTH=10
+  MIN_CLAUDE_HEIGHT=10
+  cs_entry_clear
+  SELECTED=0
+  SCROLL=0
+
+  # every pane but the picker and the client: terminals, parked or not, and
+  # anything a test left behind
+  local p
+  cs_read_state_into CLIENT_PANE client_pane
+  while read -r p; do
+    [[ -n "${p}" ]] || continue
+    [[ "${p}" == "${PICKER_PANE}" || "${p}" == "${CLIENT_PANE}" ]] && continue
+    _tmux kill-pane -t "${p}" 2>/dev/null || true
+  done < <(_tmux list-panes -a -F '#{pane_id}' 2>/dev/null)
+  _tmux resize-window -t "${PICKER_PANE}" -x 120 -y 40 2>/dev/null || true
+
+  # a test may have killed the client pane
+  cs_client_ensure
+  cs_show_welcome
+  _tmux resize-pane -t "${PICKER_PANE}" -x "${PICKER_WIDTH}" 2>/dev/null || true
+  _tmux select-pane -t "${PICKER_PANE}"
+  sleep 0.1
+}
+
+# ── Test runner ──────────────────────────────────
+run_test() {
+  local name="$1"
+  shift
+  if [[ -n "${ONLY}" && "$1" != "${ONLY}" ]]; then
+    return 0
+  fi
+  cs_test_reset
+  echo -n "  ${name} ... "
+  local output
+  if output=$("$@" 2>&1) && output+=$(ca_assert_consistent "after $1" 2>&1); then
+    echo -e "${GREEN}PASS${RESET}"
+    ((PASS_COUNT++))
+  else
+    echo -e "${RED}FAIL${RESET}"
+    [[ -n "${output}" ]] && echo "${output}"
+    ((FAIL_COUNT++))
+  fi
+}
+
+# ── Tests: the list ──────────────────────────────
+
+# An interactive session is never listed, even if Claude one day gives it an id.
+test_list_background_only() {
+  fake_add aaaaaaa1 done idle "one"
+  fake_add bbbbbbb1 done idle "typed in a terminal" "${PWD}" interactive
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  assert_eq "listed" "${ENTRIES_ID[*]}" "aaaaaaa1"
+}
+
+# This project's rows are its own sessions and the ones in its worktrees. A
+# nested directory is another project.
+test_list_this_project() {
+  fake_add aaaaaaa1 done idle "here"
+  fake_add aaaaaaa2 done idle "elsewhere" "${PWD}-other"
+  fake_add aaaaaaa3 done idle "in a worktree" "${PWD}/.claude/worktrees/fix-bug"
+  fake_add aaaaaaa4 done idle "nested project" "${PWD}/sub"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  local i mine="" theirs=""
+  for ((i = 0; i < ${#ENTRIES_ID[@]}; i++)); do
+    case "${ENTRIES_TYPE[${i}]}" in
+      local) mine+="${ENTRIES_ID[${i}]} " ;;
+      remote) theirs+="${ENTRIES_ID[${i}]} " ;;
+    esac
+  done
+  mine=$(printf '%s\n' ${mine} | sort | tr '\n' ' ')
+  theirs=$(printf '%s\n' ${theirs} | sort | tr '\n' ' ')
+  assert_eq "this project" "${mine}" "aaaaaaa1 aaaaaaa3 " || return 1
+  assert_eq "other projects" "${theirs}" "aaaaaaa2 aaaaaaa4 "
+}
+
+# An id that is not eight hex digits never gets as far as a command line.
+test_ids_validated() {
+  fake_add aaaaaaa1 done idle "fine"
+  fake_add "x;touch ${TEST_TMP}/never" done idle "hostile id"
+  fake_add 'AAAAAAA1' done idle "wrong case"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  assert_eq "listed" "${ENTRIES_ID[*]}" "aaaaaaa1" || return 1
+  assert_eq "known ids" "${AG_IDS[*]}" "aaaaaaa1"
+}
+
+# Control characters in a name are gone before it can reach the screen.
+test_name_control_chars_stripped() {
+  fake_add aaaaaaa1 done idle $'bad\e[31mname\x07'
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  case "${ENTRIES_NAME[0]}" in
+    *[[:cntrl:]]*) fail "control character left in '${ENTRIES_NAME[0]}'"; return 1 ;;
+  esac
+  assert_eq "name" "${ENTRIES_NAME[0]}" "bad [31mname "
+}
+
+# A failed poll keeps the last list and says why; it never shows an empty one.
+test_poll_failure_keeps_list() {
+  fake_add aaaaaaa1 done idle "one"
+  cs_poll 1 || { fail "first poll failed"; return 1; }
+  touch "${FAKE_CLAUDE_DIR}/fail"
+  if cs_poll 1; then
+    fail "a failing claude was reported as a success"
+    return 1
+  fi
+  assert_eq "error" "${POLL_ERROR}" "simulated failure" || return 1
+  cs_rescan
+  assert_eq "listed" "${ENTRIES_ID[*]}" "aaaaaaa1" || return 1
+  rm -f "${FAKE_CLAUDE_DIR}/fail"
+  cs_poll 1 || { fail "poll after recovery failed"; return 1; }
+  assert_eq "error after recovery" "${POLL_ERROR}" ""
+}
+
+# Recent sessions by name, then the rest by last activity; ended ones never sort
+# as recent. A session with no prompt yet is named for what it is.
+test_order_and_names() {
+  local now
+  now=$(date +%s)
+  fake_add aaaaaaa1 done idle "beta"
+  fake_add aaaaaaa2 done idle "Alpha"
+  fake_add aaaaaaa3 done idle "zeta"
+  fake_add aaaaaaa4 done idle "eta"
+  fake_add aaaaaaa5 failed "" "aaa"
+  fake_add aaaaaaa6 blocked idle "aaaaaaa6"
+  fake_transcript aaaaaaa1 $((now - 60))
+  fake_transcript aaaaaaa2 $((now - 120))
+  fake_transcript aaaaaaa3 $((now - 3600))
+  fake_transcript aaaaaaa4 $((now - 7200))
+  fake_transcript aaaaaaa5 $((now - 30))
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  local names
+  names=$(printf '%s|' "${ENTRIES_NAME[@]}")
+  # the promptless one has no transcript: it sorts by when it started, long ago
+  assert_eq "order" "${names}" "Alpha|beta|aaa (failed)|zeta|eta|(new session)|"
+}
+
+# Other projects come after this one: a header, then each project with its
+# sessions under it, most recent first. Projects that share a folder name are
+# told apart, and a custom project name wins.
+test_other_projects_rows() {
+  local now
+  now=$(date +%s)
+  fake_add aaaaaaa1 done idle "mine"
+  fake_add bbbbbbb1 done idle "older" "/work/client-a/api"
+  fake_add bbbbbbb2 done idle "newer" "/work/client-a/api"
+  fake_add ccccccc1 done idle "theirs" "/work/client-b/api"
+  fake_add ddddddd1 done idle "solo" "/work/tools"
+  fake_transcript bbbbbbb1 $((now - 5000))
+  fake_transcript bbbbbbb2 $((now - 50))
+  PROJECT_NAMES["$(cs_sanitize_path /work/tools)"]="My tools"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  local i rows=""
+  for ((i = 0; i < ${#ENTRIES_ID[@]}; i++)); do
+    rows+="${ENTRIES_TYPE[${i}]}:${ENTRIES_NAME[${i}]}|"
+  done
+  assert_eq "rows" "${rows}" \
+    "local:mine|spacer:|header:other projects|project:client-a/api|remote:newer|remote:older|spacer:|project:client-b/api|remote:theirs|spacer:|project:My tools|remote:solo|" || return 1
+  local idx
+  cs_find_entry_index bbbbbbb2 idx
+  assert_eq "a remote row carries its project path" "${ENTRIES_PATH[${idx}]}" "/work/client-a/api"
+}
+
+# Jump numbers go to the first ten rows of this project, in display order, and to
+# nothing else.
+test_jump_slots() {
+  local i idx
+  for i in 1 2 3; do
+    fake_add "aaaaaaa${i}" done idle "session ${i}"
+  done
+  fake_add bbbbbbb1 done idle "theirs" "/work/other"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  cs_compute_jump_slots
+  # slots are left over here, and still none goes to another project's rows
+  assert_eq "slots with three sessions" "${#JUMP_SLOT[@]}" "3" || return 1
+  cs_find_entry_index bbbbbbb1 idx
+  [[ ! -v "JUMP_SLOT[${idx}]" ]] || { fail "another project's row got a jump number"; return 1; }
+
+  for i in 4 5 6 7 8 9 a b c; do
+    fake_add "aaaaaaa${i}" done idle "session ${i}"
+  done
+  cs_poll 1 || { fail "second poll failed"; return 1; }
+  cs_rescan
+  cs_compute_jump_slots
+  assert_eq "slots given" "${#JUMP_SLOT[@]}" "10" || return 1
+  assert_eq "first row" "${JUMP_SLOT[0]}" "1" || return 1
+  assert_eq "tenth row is 0" "${JUMP_SLOT[9]}" "0" || return 1
+  assert_eq "key 0 goes to the tenth row" "${JUMP_TARGET[0]}" "9" || return 1
+  SHOW_INDEX=0
+  cs_compute_jump_slots
+  assert_eq "slots with show_index off" "${#JUMP_SLOT[@]}" "0"
+}
+
+# How a row looks. A session with no process is dim: `claude stop` on an idle
+# session leaves its state `done`, so the process is the only thing that changes.
+test_row_look() {
+  local now look
+  now=$(date +%s)
+  fake_add aaaaaaa1 done idle "idle, has a process"
+  fake_add aaaaaaa2 done "" "stopped while idle"
+  fake_add aaaaaaa3 blocked waiting "asked a question"
+  fake_add aaaaaaa4 working "" "starting up"
+  fake_add aaaaaaa5 failed "" "failed"
+  fake_add aaaaaaa6 stopped "" "stopped"
+  fake_add aaaaaaa7 done idle "finished since"
+  fake_add aaaaaaa8 done "" "another project's, asleep" "/work/other"
+  fake_transcript aaaaaaa7 $((now - 100))
+  seen_at aaaaaaa7 $((now - 200))
+  local id
+  for id in aaaaaaa1 aaaaaaa2 aaaaaaa5 aaaaaaa6 aaaaaaa8; do
+    seen_at "${id}" "${now}"
+  done
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  local want got
+  for want in "aaaaaaa1 running" "aaaaaaa2 dormant" "aaaaaaa3 bell" "aaaaaaa4 running" \
+              "aaaaaaa5 dormant" "aaaaaaa6 dormant" "aaaaaaa7 bell" "aaaaaaa8 dormant"; do
+    id="${want%% *}"
+    cs_row_look got "${id}" "${AG_STATE[${id}]}"
+    assert_eq "look of ${id}" "${got}" "${want#* }" || return 1
+  done
+  SHOWN="aaaaaaa2"
+  cs_row_look got aaaaaaa2 done
+  assert_eq "the shown session" "${got}" "active"
+}
+
+# The check that runs after every test, tested: it has to notice each kind of
+# leftover it is there for, and say nothing about a state that is in order.
+test_invariant_check_notices() {
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done idle "beta"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  show_with_terminal aaaaaaa1 bottom || { fail "setup failed"; return 1; }
+  local out tp stray
+  tp=$(term_pane_of aaaaaaa1)
+  out=$(ca_assert_consistent "in order") || { fail "a state in order was reported: ${out}"; return 1; }
+
+  # notices <what the check must say> — true when it fails and says it
+  notices() {
+    if out=$(ca_assert_consistent "probe"); then
+      fail "went unnoticed: $1"
+      return 1
+    fi
+    [[ "${out}" == *"$1"* ]] || { fail "reported, but not as '$1': ${out}"; return 1; }
+  }
+
+  stray=$(_tmux new-window -d -P -F '#{pane_id}' "sleep 99999")
+  notices "untracked pane ${stray}" || return 1
+  _tmux set -p -t "${stray}" @ca_placeholder 1
+  notices "placeholder pane ${stray}" || return 1
+  _tmux kill-pane -t "${stray}"
+
+  echo "aaaaaaa2" > "${STATE_DIR}/displayed"
+  notices "terminal of 'aaaaaaa1' is in the main window but 'aaaaaaa2' is displayed" || return 1
+  echo "aaaaaaa1" > "${STATE_DIR}/displayed"
+
+  rm -f "${STATE_DIR}/term/aaaaaaa1.shown"
+  notices "is marked hidden" || return 1
+  echo 1 > "${STATE_DIR}/term/aaaaaaa1.shown"
+
+  echo "%999999" > "${STATE_DIR}/term/aaaaaaa2"
+  notices "term/aaaaaaa2 references dead pane" || return 1
+  rm -f "${STATE_DIR}/term/aaaaaaa2"
+
+  echo 1 > "${STATE_DIR}/term/aaaaaaa2.shown"
+  notices "term/aaaaaaa2.shown exists but the terminal does not" || return 1
+  rm -f "${STATE_DIR}/term/aaaaaaa2.shown"
+
+  local saved_client
+  saved_client=$(cat "${STATE_DIR}/client_pane")
+  echo "%999999" > "${STATE_DIR}/client_pane"
+  notices "client pane '%999999' is gone" || return 1
+  echo "${saved_client}" > "${STATE_DIR}/client_pane"
+
+  # a second terminal in the main window
+  stray=$(_tmux split-window -d -t "${CLIENT_PANE}" -P -F '#{pane_id}' "sleep 99999")
+  echo "${stray}" > "${STATE_DIR}/term/aaaaaaa2"
+  echo 1 > "${STATE_DIR}/term/aaaaaaa2.shown"
+  notices "2 terminals in the main window" || return 1
+  _tmux kill-pane -t "${stray}"
+  rm -f "${STATE_DIR}/term/aaaaaaa2" "${STATE_DIR}/term/aaaaaaa2.shown"
+
+  # the displayed session's terminal, marked shown, but parked
+  cs_refresh_geom
+  cs_term_park "${tp}" || { fail "could not park"; return 1; }
+  notices "terminal of the displayed session is parked" || return 1
+  cs_term_show aaaaaaa1 bottom || { fail "could not bring the terminal back"; return 1; }
+
+  out=$(ca_assert_consistent "put back") || { fail "not in order after putting everything back: ${out}"; return 1; }
+}
+
+# ── Tests: the client pane ───────────────────────
+
+# A switch runs the client for the right session and records it, without ever
+# touching the picker pane, and the session shown is not sent a SIGWINCH.
+test_switch_runs_client_and_sets_state() {
+  fake_add aaaaaaa1 done idle "one"
+  fake_add aaaaaaa2 done idle "two"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_show_session aaaaaaa1 || { fail "cs_show_session failed"; return 1; }
+  wait_for "${FAKE_CLAUDE_DIR}/attach.log" || { fail "the client never ran"; return 1; }
+  assert_eq "attached" "$(cat "${FAKE_CLAUDE_DIR}/attach.log")" "aaaaaaa1" || return 1
+  assert_eq "shown" "${SHOWN}" "aaaaaaa1" || return 1
+  assert_eq "displayed" "${DISPLAYED}" "aaaaaaa1" || return 1
+  assert_eq "displayed file" "$(cat "${STATE_DIR}/displayed")" "aaaaaaa1" || return 1
+  assert_eq "client title" "$(client_title)" "${CS_T_SWITCHING}" || return 1
+  cs_show_session aaaaaaa2 || { fail "second switch failed"; return 1; }
+  settle
+  assert_eq "attached, in order" "$(tr '\n' ' ' < "${FAKE_CLAUDE_DIR}/attach.log")" "aaaaaaa1 aaaaaaa2 " || return 1
+  assert_eq "SIGWINCH to the session shown" "$(client_winch aaaaaaa2)" "0"
+}
+
+# Geometry never changes while a client is attached. In the one tmux call that
+# makes a switch, a placeholder takes the old client's place before any terminal
+# moves, and the new client is started last. A resize in the first moments of a
+# client's life cannot be seen from outside, so the order itself is checked.
+test_switch_chain_order() {
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done idle "beta"
+  fake_add aaaaaaa3 done idle "gamma"
+  fake_add aaaaaaa4 done idle "delta"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  show_with_terminal aaaaaaa1 bottom || { fail "setup A failed"; return 1; }
+  show_with_terminal aaaaaaa2 side || { fail "setup B failed"; return 1; }
+  cs_show_session aaaaaaa1 || { fail "back to A failed"; return 1; }
+  show_with_terminal aaaaaaa3 bottom || { fail "setup C failed"; return 1; }
+
+  # record every tmux call that starts a client
+  eval "$(declare -f _tmux | sed '1s/^_tmux/_tmux_real/')"
+  _tmux() {
+    if [[ "$*" == *"client.sh attach"* ]]; then
+      {
+        printf '%s\n' "$@"
+        echo "--call--"
+      } >> "${TEST_TMP}/chains"
+    fi
+    _tmux_real "$@"
+  }
+  # C to B: bottom to side, the client pane changes shape
+  cs_show_session aaaaaaa2
+  # B to A, A to C: C and A are both bottom, at the same size
+  cs_show_session aaaaaaa1
+  cs_show_session aaaaaaa3
+  # C to D: D has no terminal
+  cs_show_session aaaaaaa4
+  eval "$(declare -f _tmux_real | sed '1s/^_tmux_real/_tmux/')"
+
+  # one line per call: the tmux commands in it, in order
+  local -a calls=()
+  local word verbs="" start=1 last=""
+  while IFS= read -r word; do
+    if [[ "${word}" == "--call--" ]]; then
+      calls+=("${verbs}| ${last}")
+      verbs=""
+      start=1
+      continue
+    fi
+    if ((start)); then
+      verbs+="${word} "
+      start=0
+    fi
+    [[ "${word}" == ";" ]] && start=1
+    last="${word}"
+  done < "${TEST_TMP}/chains"
+  rm -f "${TEST_TMP}/chains"
+
+  assert_eq "tmux calls for four switches" "${#calls[@]}" "4" || return 1
+  assert_eq "different layouts" "${calls[0]}" \
+    "select-pane respawn-pane swap-pane kill-pane join-pane resize-pane respawn-pane | ${STATE_DIR}/client.sh attach aaaaaaa2" || return 1
+  assert_eq "different layouts, back" "${calls[1]}" \
+    "select-pane respawn-pane swap-pane kill-pane join-pane resize-pane respawn-pane | ${STATE_DIR}/client.sh attach aaaaaaa1" || return 1
+  assert_eq "the same layout" "${calls[2]}" \
+    "select-pane swap-pane respawn-pane | ${STATE_DIR}/client.sh attach aaaaaaa3" || return 1
+  assert_eq "to a session with no terminal" "${calls[3]}" \
+    "select-pane respawn-pane swap-pane kill-pane resize-pane respawn-pane | ${STATE_DIR}/client.sh attach aaaaaaa4"
+}
+
+# An id that is not a job id is refused before anything is respawned. The id here
+# would run a command if it reached the pane's shell, so keep it harmless.
+test_switch_refuses_bad_id() {
+  local canary="${TEST_TMP}/reached-a-shell"
+  if cs_show_session "x; touch ${canary}"; then
+    fail "a bad id was accepted"
+    return 1
+  fi
+  sleep 0.3
+  [[ ! -e "${canary}" ]] || { fail "the id was run as a command"; return 1; }
+  assert_eq "client title" "$(client_title)" "${CS_T_WELCOME}"
+}
+
+# tmux keeps a pane title across respawn-pane. After a switch from A to B the
+# picker must not read A's old title and adopt A again.
+test_switch_no_readopt() {
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done idle "beta"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_show_session aaaaaaa1 || { fail "show A failed"; return 1; }
+  # as if A had been opened from agent view: Claude sets the title to its name
+  set_client_title "alpha"
+  look
+  assert_eq "shown before" "${SHOWN}" "aaaaaaa1" || return 1
+  cs_show_session aaaaaaa2 || { fail "show B failed"; return 1; }
+  look
+  assert_eq "shown after the switch" "${SHOWN}" "aaaaaaa2" || return 1
+  assert_eq "displayed after the switch" "${DISPLAYED}" "aaaaaaa2"
+}
+
+# An empty target makes tmux act on the active pane, which is the picker.
+test_empty_client_target_refused() {
+  local picker_title
+  picker_title=$(_tmux display-message -p -t "${PICKER_PANE}" '#{pane_title}')
+  local saved="${CLIENT_PANE}"
+  CLIENT_PANE=""
+  if cs_client_respawn "${CS_T_SWITCHING}" "sleep 5"; then
+    fail "a respawn with no client pane was accepted"
+    return 1
+  fi
+  CLIENT_PANE="${saved}"
+  sleep 0.2
+  assert_eq "picker pane pid" "$(pane_pid "${PICKER_PANE}")" "${PICKER_PID0}" || return 1
+  assert_eq "picker pane title" "$(_tmux display-message -p -t "${PICKER_PANE}" '#{pane_title}')" "${picker_title}"
+}
+
+# When tmux stops part-way through a switch, the picker ends on the welcome
+# screen with nothing displayed, and no placeholder or slot is left behind.
+test_switch_failure_ends_on_welcome() {
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done idle "beta"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  show_with_terminal aaaaaaa1 bottom || { fail "setup failed"; return 1; }
+  local ta
+  ta=$(term_pane_of aaaaaaa1)
+  # tmux refuses the chain that would show B. A slot for A's terminal has been
+  # made by then.
+  eval "$(declare -f _tmux | sed '1s/^_tmux/_tmux_real/')"
+  _tmux() {
+    if [[ "$*" == *"client.sh attach aaaaaaa2"* ]]; then
+      return 1
+    fi
+    _tmux_real "$@"
+  }
+  local rc=0
+  cs_show_session aaaaaaa2 || rc=$?
+  eval "$(declare -f _tmux_real | sed '1s/^_tmux_real/_tmux/')"
+  assert_eq "result" "${rc}" "1" || return 1
+  assert_eq "displayed" "${DISPLAYED}" "" || return 1
+  assert_eq "shown" "${SHOWN}" "" || return 1
+  assert_eq "client title" "$(client_title)" "${CS_T_WELCOME}" || return 1
+  pane_is_alive "${ta}" || { fail "the terminal was lost"; return 1; }
+  if in_main "${ta}"; then
+    fail "the terminal is still beside the welcome screen"
+    return 1
+  fi
+  local tagged
+  tagged=$(_tmux list-panes -a -F '#{?@ca_placeholder,1,0}' | grep -c 1)
+  assert_eq "placeholders left" "${tagged}" "0"
+}
+
+# The title decides what is shown: a session's name, agent view, or nothing new.
+test_follow_title_mapping() {
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done idle "beta"
+  fake_add aaaaaaa3 done idle "dup"
+  fake_add aaaaaaa4 done idle "dup"
+  fake_add aaaaaaa5 done idle "far away" "${PWD}-other"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+
+  set_client_title "alpha"; look
+  assert_eq "a session's name" "${SHOWN}" "aaaaaaa1" || return 1
+  assert_eq "adopted" "${DISPLAYED}" "aaaaaaa1" || return 1
+
+  set_client_title "claude agents"; look
+  assert_eq "agent view" "${SHOWN}" "" || return 1
+  assert_eq "agent view leaves displayed" "${DISPLAYED}" "aaaaaaa1" || return 1
+
+  set_client_title "beta"; look
+  assert_eq "another session" "${SHOWN}" "aaaaaaa2" || return 1
+
+  set_client_title "2 awaiting input · claude agents"; look
+  assert_eq "agent view with a count" "${SHOWN}" "" || return 1
+
+  set_client_title "alpha"; look
+  set_client_title "Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA"; look
+  assert_eq "an unknown title" "${SHOWN}" "aaaaaaa1" || return 1
+
+  set_client_title "dup"; look
+  assert_eq "a name two sessions share" "${SHOWN}" "aaaaaaa1" || return 1
+
+  set_client_title "far away"; look
+  assert_eq "another project's session" "${SHOWN}" "aaaaaaa5" || return 1
+  assert_eq "another project's session is not adopted" "${DISPLAYED}" "aaaaaaa1" || return 1
+  local look_
+  cs_row_look look_ aaaaaaa5 done
+  assert_eq "its row is highlighted" "${look_}" "active" || return 1
+
+  set_client_title "${CS_T_WELCOME}"; look
+  assert_eq "client gone" "${SHOWN}" "" || return 1
+  assert_eq "client gone clears displayed" "${DISPLAYED}" ""
+}
+
+# Opening agent view from the picker is not an exit: displayed stays.
+test_agents_view_keeps_displayed() {
+  fake_add aaaaaaa1 done idle "alpha"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_show_session aaaaaaa1 || { fail "show failed"; return 1; }
+  # hold the fake's own title back, so the marker is what gets read
+  touch "${FAKE_CLAUDE_DIR}/slow_agents"
+  cs_open_agents
+  look
+  assert_eq "shown" "${SHOWN}" "" || return 1
+  assert_eq "displayed" "${DISPLAYED}" "aaaaaaa1" || return 1
+  assert_eq "client title" "$(client_title)" "${CS_T_AGENTS}" || return 1
+  wait_for "${FAKE_CLAUDE_DIR}/attach.log"
+  assert_eq "what ran" "$(tail -1 "${FAKE_CLAUDE_DIR}/attach.log")" "agents"
+}
+
+# When the client exits, the wrapper resets the title, and the picker lets go of
+# the session. tmux would otherwise keep the old title for good.
+test_client_exit_clears_displayed() {
+  fake_add aaaaaaa1 done idle "alpha"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_show_session aaaaaaa1 || { fail "show failed"; return 1; }
+  wait_for "${FAKE_CLAUDE_DIR}/attach.pid" || { fail "the client never ran"; return 1; }
+  kill "$(cat "${FAKE_CLAUDE_DIR}/attach.pid")"
+  local i
+  for ((i = 0; i < 40; i++)); do
+    [[ "$(client_title)" == "${CS_T_WELCOME}" ]] && break
+    sleep 0.05
+  done
+  look
+  assert_eq "client title" "$(client_title)" "${CS_T_WELCOME}" || return 1
+  assert_eq "shown" "${SHOWN}" "" || return 1
+  assert_eq "displayed" "${DISPLAYED}" "" || return 1
+  pane_is_alive "${CLIENT_PANE}" || { fail "the client pane died with its client"; return 1; }
+}
+
+# A reload starts a new picker: the highlight must still be on the shown session.
+test_reload_keeps_shown() {
+  fake_add aaaaaaa1 done idle "alpha"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_show_session aaaaaaa1 || { fail "show failed"; return 1; }
+  # what a freshly exec'd picker knows: nothing but the state dir and tmux
+  SHOWN=""
+  DISPLAYED=""
+  cs_read_state_into DISPLAYED displayed
+  cs_refresh_pane_cache
+  cs_shown_at_startup
+  assert_eq "shown after a reload" "${SHOWN}" "aaaaaaa1" || return 1
+  cs_follow
+  assert_eq "shown after the first scan" "${SHOWN}" "aaaaaaa1"
+}
+
+# A client pane that was killed comes back, with the welcome screen.
+test_client_pane_recreated() {
+  local old="${CLIENT_PANE}"
+  _tmux kill-pane -t "${CLIENT_PANE}"
+  cs_tick
+  [[ -n "${CLIENT_PANE}" && "${CLIENT_PANE}" != "${old}" ]] || { fail "no new client pane (${CLIENT_PANE})"; return 1; }
+  pane_is_alive "${CLIENT_PANE}" || { fail "the new client pane is not alive"; return 1; }
+  assert_eq "client title" "$(client_title)" "${CS_T_WELCOME}"
+}
+
+# A switch finds the client pane dead: it makes a new one and carries on.
+test_switch_recreates_dead_client() {
+  fake_add aaaaaaa1 done idle "alpha"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  local old="${CLIENT_PANE}"
+  _tmux kill-pane -t "${CLIENT_PANE}"
+  cs_show_session aaaaaaa1 || { fail "the switch gave up"; return 1; }
+  [[ "${CLIENT_PANE}" != "${old}" ]] || { fail "no new client pane"; return 1; }
+  wait_for "${FAKE_CLAUDE_DIR}/attach.log" || { fail "the client never ran"; return 1; }
+  assert_eq "displayed" "${DISPLAYED}" "aaaaaaa1"
+}
+
+# ── Tests: actions ───────────────────────────────
+
+# A new session is shown once Claude lists it, even when that takes a few polls.
+test_new_session_waits_for_id() {
+  echo 2 > "${FAKE_CLAUDE_DIR}/delay"
+  cs_new_session || { fail "cs_new_session failed: ${FOOTER_MSG}"; return 1; }
+  assert_eq "command" "$(cat "${FAKE_CLAUDE_DIR}/cmd.log")" "bg --bg" || return 1
+  assert_eq "shown" "${SHOWN}" "f0000001" || return 1
+  assert_eq "new_session file" "$(cat "${STATE_DIR}/new_session")" "f0000001" || return 1
+  wait_for "${FAKE_CLAUDE_DIR}/attach.log" || { fail "the client never ran"; return 1; }
+  assert_eq "attached" "$(tail -1 "${FAKE_CLAUDE_DIR}/attach.log")" "f0000001"
+}
+
+# When the output carries no id, it is the entry that was not there before, in
+# this project: a session someone starts elsewhere at the same moment is new to
+# the list too.
+test_new_session_id_from_list() {
+  fake_add aaaaaaa1 done idle "already here"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  # appears after the picker's last look at the list
+  fake_add aaaaaaa2 blocked idle "someone else's" "${PWD}-other"
+  touch "${FAKE_CLAUDE_DIR}/quiet"
+  cs_new_session || { fail "cs_new_session failed: ${FOOTER_MSG}"; return 1; }
+  assert_eq "shown" "${SHOWN}" "f0000001"
+}
+
+# A failing `claude --bg` is reported with Claude's own line.
+test_new_session_failure_reported() {
+  touch "${FAKE_CLAUDE_DIR}/fail"
+  # the fake's --bg does not look at `fail`; make it refuse another way
+  cat > "${TEST_TMP}/bin/claude.real" < "${TEST_TMP}/bin/claude"
+  cat > "${TEST_TMP}/bin/claude" << 'FAKE'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--bg" ]]; then
+  echo "Could not start the background service" >&2
+  exit 1
+fi
+exec "$(dirname "$0")/claude.real" "$@"
+FAKE
+  rm -f "${FAKE_CLAUDE_DIR}/fail"
+  local rc=0
+  cs_new_session || rc=$?
+  cat "${TEST_TMP}/bin/claude.real" > "${TEST_TMP}/bin/claude"
+  rm -f "${TEST_TMP}/bin/claude.real"
+  assert_eq "result" "${rc}" "1" || return 1
+  assert_eq "footer" "${FOOTER_MSG}" "Could not start the background service" || return 1
+  assert_eq "client title" "$(client_title)" "${CS_T_WELCOME}"
+}
+
+# `claude --bg` cannot ask about an untrusted directory: it has no terminal. The
+# picker opens agent view, which shows Claude's trust dialog.
+test_new_session_untrusted_opens_agents() {
+  touch "${FAKE_CLAUDE_DIR}/untrusted" "${FAKE_CLAUDE_DIR}/slow_agents"
+  local rc=0
+  cs_new_session || rc=$?
+  assert_eq "result" "${rc}" "1" || return 1
+  [[ "${FOOTER_MSG}" == "Workspace not trusted"* ]] || { fail "footer: '${FOOTER_MSG}'"; return 1; }
+  assert_eq "client title" "$(client_title)" "${CS_T_AGENTS}" || return 1
+  wait_for "${FAKE_CLAUDE_DIR}/attach.log" || { fail "agent view never ran"; return 1; }
+  assert_eq "what ran" "$(tail -1 "${FAKE_CLAUDE_DIR}/attach.log")" "agents"
+}
+
+# A new session nobody typed into is removed when the user moves on. One that got
+# a prompt in the meantime is left alone, even though the picker's own list still
+# says it is waiting: `claude rm` stops work without asking.
+test_untouched_cleanup_guard() {
+  fake_add aaaaaaa1 done idle "alpha"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+
+  cs_new_session || { fail "first new session failed"; return 1; }
+  cs_show_session aaaaaaa1 || { fail "switch away failed"; return 1; }
+  grep -qx "rm f0000001" "${FAKE_CLAUDE_DIR}/cmd.log" || { fail "an untouched new session was not removed"; return 1; }
+  [[ ! -f "${STATE_DIR}/new_session" ]] || { fail "new_session file left behind"; return 1; }
+
+  cs_new_session || { fail "second new session failed"; return 1; }
+  # the user sends a prompt; the picker has not polled since
+  fake_set f0000002 working busy
+  fake_transcript f0000002 "$(date +%s)"
+  cs_show_session aaaaaaa1 || { fail "second switch away failed"; return 1; }
+  if grep -qx "rm f0000002" "${FAKE_CLAUDE_DIR}/cmd.log"; then
+    fail "a session that had just been given a prompt was removed"
+    return 1
+  fi
+
+  # the prompt is in the transcript, but Claude still lists the session as waiting
+  rm -f "${STATE_DIR}/new_session"
+  cs_new_session || { fail "third new session failed"; return 1; }
+  fake_transcript f0000003 "$(date +%s)"
+  cs_show_session aaaaaaa1 || { fail "third switch away failed"; return 1; }
+  if grep -qx "rm f0000003" "${FAKE_CLAUDE_DIR}/cmd.log"; then
+    fail "a session with a transcript was removed"
+    return 1
+  fi
+}
+
+# Stop asks first, goes back to the welcome screen for the shown session, and
+# puts Claude's own answer in the footer. The row stays, and turns dim: stopping
+# an idle session changes nothing but its process.
+test_stop_shows_feedback() {
+  fake_add aaaaaaa1 done idle "alpha"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  cs_show_session aaaaaaa1 || { fail "show failed"; return 1; }
+  SELECTED=0
+  cs_confirm_end stop "Stop? y/N" <<< "n" > /dev/null
+  [[ ! -f "${FAKE_CLAUDE_DIR}/cmd.log" ]] || { fail "stopped without a yes"; return 1; }
+  cs_confirm_end stop "Stop? y/N" <<< "y" > /dev/null
+  assert_eq "command" "$(cat "${FAKE_CLAUDE_DIR}/cmd.log")" "stop aaaaaaa1" || return 1
+  assert_eq "footer" "${FOOTER_MSG}" "stopped aaaaaaa1" || return 1
+  assert_eq "displayed" "${DISPLAYED}" "" || return 1
+  assert_eq "client title" "$(client_title)" "${CS_T_WELCOME}" || return 1
+  assert_eq "still listed" "${ENTRIES_ID[*]}" "aaaaaaa1" || return 1
+  seen_at aaaaaaa1 "$(date +%s)"
+  cs_poll 1
+  cs_rescan
+  local look_
+  cs_row_look look_ aaaaaaa1 "${AG_STATE[aaaaaaa1]}"
+  assert_eq "its row after the stop" "${look_}" "dormant"
+}
+
+test_remove_drops_the_row() {
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done idle "beta"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  local idx
+  cs_find_entry_index aaaaaaa1 idx
+  SELECTED=${idx}
+  cs_confirm_end rm "Remove (stops work)? y/N" <<< "y" > /dev/null
+  assert_eq "footer" "${FOOTER_MSG}" "removed aaaaaaa1" || return 1
+  assert_eq "listed" "${ENTRIES_ID[*]}" "aaaaaaa2"
+}
+
+# A prefix key pressed from the Claude pane means the session being looked at,
+# not the row the picker's cursor was left on. With nothing shown, the cursor
+# row it is.
+test_prefix_stop_targets_shown() {
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done idle "beta"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  cs_show_session aaaaaaa2 || { fail "show failed"; return 1; }
+  local idx
+  cs_find_entry_index aaaaaaa1 idx
+  SELECTED=${idx}
+  # the user is in the Claude pane
+  _tmux select-pane -t "${CLIENT_PANE}"
+  cs_prefix_end stop "Stop? y/N" <<< "y" > /dev/null
+  assert_eq "stopped from the Claude pane" "$(cat "${FAKE_CLAUDE_DIR}/cmd.log")" "stop aaaaaaa2" || return 1
+
+  # nothing is shown now (the stop went back to welcome): the cursor row is used
+  : > "${FAKE_CLAUDE_DIR}/cmd.log"
+  cs_find_entry_index aaaaaaa1 idx
+  SELECTED=${idx}
+  _tmux select-pane -t "${CLIENT_PANE}"
+  cs_prefix_end stop "Stop? y/N" <<< "y" > /dev/null
+  assert_eq "stopped with nothing shown" "$(cat "${FAKE_CLAUDE_DIR}/cmd.log")" "stop aaaaaaa1" || return 1
+
+  # from the picker itself, the cursor row, even with another session shown
+  : > "${FAKE_CLAUDE_DIR}/cmd.log"
+  cs_show_session aaaaaaa2 || { fail "show failed"; return 1; }
+  cs_find_entry_index aaaaaaa1 idx
+  SELECTED=${idx}
+  _tmux select-pane -t "${PICKER_PANE}"
+  cs_prefix_end stop "Stop? y/N" <<< "y" > /dev/null
+  assert_eq "stopped from the picker" "$(cat "${FAKE_CLAUDE_DIR}/cmd.log")" "stop aaaaaaa1" || return 1
+
+  # the list is drawn again before the question, so the row asked about is the
+  # one the user sees highlighted
+  local out
+  out=$(cs_prefix_end stop "Stop? y/N" <<< "n")
+  [[ "${out}" == *"beta"*"Stop? y/N"* ]] || { fail "the list is not drawn before the question"; return 1; }
+}
+
+# The shutdown question says that terminals die, when there are any.
+test_shutdown_prompt() {
+  fake_add aaaaaaa1 done idle "alpha"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  local out
+  out=$(cs_confirm_shutdown <<< "n")
+  [[ "${out}" == *"Shutdown? y/N"* ]] || { fail "plain prompt not shown"; return 1; }
+  show_with_terminal aaaaaaa1 bottom || { fail "setup failed"; return 1; }
+  out=$(cs_confirm_shutdown <<< "n")
+  [[ "${out}" == *"kill terminals"* ]] || { fail "the prompt does not mention terminals"; return 1; }
+  pane_is_alive "${PICKER_PANE}" || { fail "answering no shut the server down"; return 1; }
+}
+
+# ── Tests: what the picker draws ─────────────────
+
+# A note (a command's own line, or a failing poll) has a row of its own between
+# the key hints and the version: centered, in the bell colour, cut to the pane,
+# with an empty row above and below. The version stays, two rows lower.
+test_footer_note() {
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done idle "beta"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  local -a row
+  local hints version note
+  hints=$(centered40 "Q:detach  ?:help")
+  version=$(centered40 "claude-agents v${VERSION}")
+
+  # 40 columns by 20 rows: 1 header, 2-3 sessions, 4 empty, 5-6 key hints
+  screen_rows 40 20
+  assert_eq "key hints" "${row[6]}" "${hints}" || return 1
+  assert_eq "no note: the row under the key hints" "${row[7]}" "" || return 1
+  assert_eq "no note: the version" "${row[8]}" "${version}" || return 1
+
+  FOOTER_MSG="stopped aaaaaaa1"
+  note=$(centered40 "${FOOTER_MSG}")
+  screen_rows 40 20
+  assert_eq "key hints, with a note" "${row[6]}" "${hints}" || return 1
+  assert_eq "the row above the note" "${row[7]}" "" || return 1
+  assert_eq "the note" "${row[8]}" "${note}" || return 1
+  assert_eq "the row below the note" "${row[9]}" "" || return 1
+  assert_eq "the version, with a note" "${row[10]}" "${version}" || return 1
+  assert_eq "the row below the version" "${row[11]}" "" || return 1
+  screen_rows 40 20 colors
+  [[ "${row[8]}" == *$'\e[31m'*"stopped aaaaaaa1"* ]] || { fail "the note is not in the bell colour: $(printf '%q' "${row[8]}")"; return 1; }
+
+  # longer than the pane: cut, not wrapped
+  FOOTER_MSG="0123456789012345678901234567890123456789ABCDEFGHIJKLMNOPQRST"
+  screen_rows 40 20
+  assert_eq "a long note" "${row[8]}" "0123456789012345678901234567890123456789" || return 1
+  assert_eq "the row below a long note" "${row[9]}" "" || return 1
+
+  # a failing poll is the note, before any command's line
+  FOOTER_MSG="stopped aaaaaaa1"
+  POLL_ERROR="simulated failure"
+  screen_rows 40 20
+  assert_eq "a failing poll" "${row[8]}" "$(centered40 "simulated failure")" || return 1
+  POLL_ERROR=""
+
+  # A list that fills the pane: 16 sessions, where 15 rows fit. While a note is
+  # shown the list gives up two rows, so the note still has its three.
+  local i
+  for i in 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10; do
+    fake_add "aaaaaa${i}" done idle "session ${i}"
+  done
+  cs_poll 1 || { fail "second poll failed"; return 1; }
+  cs_rescan
+  SELECTED=0
+  SCROLL=0
+  screen_rows 40 20
+  assert_eq "full list: key hints" "${row[17]}" "${hints}" || return 1
+  assert_eq "full list: the row above the note" "${row[18]}" "" || return 1
+  assert_eq "full list: the note" "${row[19]}" "${note}" || return 1
+  assert_eq "full list: the row below the note" "${row[20]}" "" || return 1
+  FOOTER_MSG=""
+  screen_rows 40 20
+  assert_eq "full list, no note: key hints are back down" "${row[19]}" "${hints}" || return 1
+
+  # The search view has no footer and shows no note: a failing poll must not
+  # take rows from the list there.
+  POLL_ERROR="simulated failure"
+  SEARCH_ACTIVE=1
+  screen_rows 40 20
+  [[ "${row[16]}" == *"session"* || "${row[16]}" == *"alpha"* || "${row[16]}" == *"beta"* ]] \
+    || { fail "searching: the list lost rows to a note that is not shown: '${row[16]}'"; return 1; }
+}
+
+# With no sessions there is no footer. A command that failed still has to say
+# so: its line goes under the empty-list text, drawn like any other note.
+test_empty_list_note() {
+  cs_rescan
+  local -a row
+  screen_rows 40 20
+  assert_eq "the empty-list text" "${row[2]}" "  No sessions. :c starts one" || return 1
+  assert_eq "no note" "${row[4]}" "" || return 1
+
+  FOOTER_MSG="Could not start the service"
+  screen_rows 40 20
+  assert_eq "the empty-list text, with a note" "${row[2]}" "  No sessions. :c starts one" || return 1
+  assert_eq "the row above the note" "${row[3]}" "" || return 1
+  assert_eq "the note" "${row[4]}" "$(centered40 "${FOOTER_MSG}")" || return 1
+  assert_eq "the row below the note" "${row[5]}" "" || return 1
+
+  # a failing poll keeps its own row; the command's line is still shown
+  POLL_ERROR="simulated failure"
+  screen_rows 40 20
+  assert_eq "a failing poll" "${row[2]}" "  simulated failure" || return 1
+  assert_eq "the note, under a failing poll" "${row[4]}" "$(centered40 "${FOOTER_MSG}")"
+}
+
+# ── Tests: attention ─────────────────────────────
+
+# Finished, unseen: by the time the last turn ended, read from the transcript,
+# against the last time the session was shown. Never by the file's mtime, and
+# never for a session that was never shown here.
+test_unseen_rules() {
+  local now
+  now=$(date +%s)
+  # A: finished after it was last shown
+  fake_add aaaaaaa1 done idle "finished since"
+  fake_transcript aaaaaaa1 $((now - 100))
+  seen_at aaaaaaa1 $((now - 200))
+  # B: shown after it finished
+  fake_add aaaaaaa2 done idle "seen"
+  fake_transcript aaaaaaa2 $((now - 300))
+  seen_at aaaaaaa2 $((now - 200))
+  # C: like B, but its process was stopped since: housekeeping moved the mtime
+  fake_add aaaaaaa3 done idle "seen, then stopped"
+  fake_transcript aaaaaaa3 $((now - 300))
+  seen_at aaaaaaa3 $((now - 200))
+  fake_housekeeping aaaaaaa3
+  # D: never shown here, so there is nothing to compare against: not flagged
+  fake_add aaaaaaa4 done idle "never shown"
+  fake_transcript aaaaaaa4 $((now - 300))
+  # E: still working, never shown
+  fake_add aaaaaaa5 working busy "working"
+  # F: a transcript with nothing but housekeeping in it
+  fake_add aaaaaaa6 done idle "unreadable"
+  echo '{"type":"cost-state"}' > "$(transcript_of aaaaaaa6)"
+  seen_at aaaaaaa6 $((now - 200))
+  # G: failed after it was last shown
+  fake_add aaaaaaa7 failed "" "failed since"
+  fake_transcript aaaaaaa7 $((now - 100))
+  seen_at aaaaaaa7 $((now - 200))
+  # H: still working, though shown before its last record
+  fake_add aaaaaaa8 working busy "working, seen"
+  fake_transcript aaaaaaa8 $((now - 100))
+  seen_at aaaaaaa8 $((now - 200))
+
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  local flagged
+  flagged=$(printf '%s\n' "${!UNSEEN_SET[@]}" | sort | tr '\n' ' ')
+  assert_eq "flagged" "${flagged}" "aaaaaaa1 aaaaaaa7 " || return 1
+  assert_eq "A read from a record" "${AG_ACT_SRC[aaaaaaa1]}" "record" || return 1
+  assert_eq "A last activity" "${AG_ACT[aaaaaaa1]}" "$((now - 100))" || return 1
+  assert_eq "C last activity ignores housekeeping" "${AG_ACT[aaaaaaa3]}" "$((now - 300))" || return 1
+  assert_eq "F fell back to the mtime" "${AG_ACT_SRC[aaaaaaa6]}" "mtime"
+}
+
+# Looking at a session clears its flag at once, and for the other pickers too.
+test_mark_seen_clears_unseen() {
+  local now
+  now=$(date +%s)
+  fake_add aaaaaaa1 done idle "finished since"
+  fake_transcript aaaaaaa1 $((now - 100))
+  seen_at aaaaaaa1 $((now - 200))
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  [[ -v "UNSEEN_SET[aaaaaaa1]" ]] || { fail "not flagged to begin with"; return 1; }
+  cs_mark_seen aaaaaaa1
+  cs_rescan
+  [[ ! -v "UNSEEN_SET[aaaaaaa1]" ]] || { fail "still flagged after being looked at"; return 1; }
+  # what another picker would read
+  cs_poll 1 || { fail "second poll failed"; return 1; }
+  cs_rescan
+  [[ ! -v "UNSEEN_SET[aaaaaaa1]" ]] || { fail "flagged again after a poll"; return 1; }
+}
+
+# A scan marks the shown session as seen only while the terminal window has focus.
+test_seen_needs_window_focus() {
+  fake_add aaaaaaa1 done idle "alpha"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_show_session aaaaaaa1 || { fail "show failed"; return 1; }
+  WINDOW_FOCUSED=0
+  cs_tick
+  [[ ! -e "${SEEN_DIR}/aaaaaaa1" ]] || { fail "marked seen while the window had no focus"; return 1; }
+  WINDOW_FOCUSED=1
+  cs_tick
+  [[ -e "${SEEN_DIR}/aaaaaaa1" ]] || { fail "not marked seen with the window focused"; return 1; }
+}
+
+# seen/ is swept: a file whose session has been gone for five successful polls is
+# removed. A failed poll proves nothing and does not count.
+test_seen_sweep() {
+  fake_add aaaaaaa1 done idle "alive"
+  seen_at aaaaaaa1 "$(date +%s)"
+  seen_at dddddddd "$(date +%s)"
+  local i
+  for i in 1 2 3 4; do
+    cs_poll 1 || { fail "poll ${i} failed"; return 1; }
+  done
+  [[ -e "${SEEN_DIR}/dddddddd" ]] || { fail "swept after only four polls"; return 1; }
+  touch "${FAKE_CLAUDE_DIR}/fail"
+  cs_poll 1
+  cs_poll 1
+  rm -f "${FAKE_CLAUDE_DIR}/fail"
+  [[ -e "${SEEN_DIR}/dddddddd" ]] || { fail "swept on failed polls"; return 1; }
+  cs_poll 1 || { fail "fifth poll failed"; return 1; }
+  [[ ! -e "${SEEN_DIR}/dddddddd" ]] || { fail "not swept after five polls"; return 1; }
+  [[ -e "${SEEN_DIR}/aaaaaaa1" ]] || { fail "a live session's file was swept"; return 1; }
+}
+
+# ── Tests: other projects ────────────────────────
+
+# Selecting another project, or one of its sessions, leaves the launcher a
+# switch_target: the project path, then the session to show there.
+test_hop_writes_switch_target() {
+  fake_add bbbbbbb1 done idle "theirs" "/work/other"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  local idx
+  cs_find_entry_index bbbbbbb1 idx
+  SELECTED=${idx}
+  cs_activate_selected
+  assert_eq "for a session" "$(cat "${STATE_DIR}/switch_target")" $'/work/other\nbbbbbbb1' || return 1
+  [[ ! -f "${STATE_DIR}/pending_load" ]] || { fail "the picker wrote pending_load itself"; return 1; }
+  assert_eq "nothing shown here" "${SHOWN}" "" || return 1
+
+  rm -f "${STATE_DIR}/switch_target"
+  SELECTED=$((idx - 1))
+  assert_eq "the row above is the project" "${ENTRIES_TYPE[${SELECTED}]}" "project" || return 1
+  cs_activate_selected
+  assert_eq "for a project" "$(sed -n 1p "${STATE_DIR}/switch_target")" "/work/other" || return 1
+  assert_eq "a project names no session" "$(sed -n 2p "${STATE_DIR}/switch_target")" ""
+}
+
+# A session the launcher left in pending_load is shown, once, if it is this
+# project's and its id is a job id.
+test_pending_load_shows_session() {
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add bbbbbbb1 done idle "theirs" "/work/other"
+  echo "aaaaaaa1" > "${STATE_DIR}/pending_load"
+  cs_consume_pending_load
+  assert_eq "shown" "${SHOWN}" "aaaaaaa1" || return 1
+  [[ ! -f "${STATE_DIR}/pending_load" ]] || { fail "pending_load not consumed"; return 1; }
+
+  cs_show_welcome
+  local canary="${TEST_TMP}/pending-ran"
+  echo "x; touch ${canary}" > "${STATE_DIR}/pending_load"
+  cs_consume_pending_load
+  sleep 0.2
+  [[ ! -e "${canary}" ]] || { fail "pending_load content was run as a command"; return 1; }
+  assert_eq "a bad id shows nothing" "${SHOWN}" "" || return 1
+
+  echo "bbbbbbb1" > "${STATE_DIR}/pending_load"
+  cs_consume_pending_load
+  assert_eq "another project's session is not shown here" "${SHOWN}" ""
+}
+
+# ── Tests: terminals ─────────────────────────────
+
+# A terminal opens beside the client pane, in the session's own directory: a
+# session working in a worktree gets a shell in that worktree.
+test_term_opens_in_session_cwd() {
+  local wt="${PWD}/.claude/worktrees/fix-bug"
+  mkdir -p "${wt}"
+  fake_add aaaaaaa1 done idle "alpha" "${wt}"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_show_session aaaaaaa1 || { fail "show failed"; return 1; }
+  cs_term_smart
+  local tp
+  tp=$(term_pane_of aaaaaaa1)
+  [[ -n "${tp}" ]] || { fail "no terminal was created"; return 1; }
+  wait_for "${FAKE_CLAUDE_DIR}/termcwd.${tp#%}" || { fail "the terminal never started"; return 1; }
+  assert_eq "directory" "$(cat "${FAKE_CLAUDE_DIR}/termcwd.${tp#%}")" "${wt}" || return 1
+  in_main "${tp}" || { fail "the terminal is not in the main window"; return 1; }
+  [[ -f "${STATE_DIR}/term/aaaaaaa1.shown" ]] || { fail "not marked shown"; return 1; }
+  assert_eq "orientation" "$(cat "${STATE_DIR}/term/aaaaaaa1.orient")" "bottom" || return 1
+  assert_eq "focus" "$(_tmux display-message -p '#{pane_id}')" "${tp}"
+}
+
+# With nothing displayed there is no terminal to open: the welcome screen has none.
+test_term_keys_need_a_session() {
+  cs_term_smart
+  cs_term_toggle
+  cs_term_smart side
+  local n
+  n=$(find "${STATE_DIR}/term" -type f | wc -l | tr -d ' ')
+  assert_eq "terminal state files" "${n}" "0" || return 1
+  assert_eq "panes" "$(_tmux list-panes -a | wc -l | tr -d ' ')" "2"
+}
+
+# A terminal belongs to its session, not to a pane: it survives a switch away and
+# back as the same pane, at the same size, without being sent a SIGWINCH.
+test_term_survives_switch() {
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done idle "beta"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  show_with_terminal aaaaaaa1 bottom || { fail "setup failed"; return 1; }
+  local tp size t0 a0
+  tp=$(term_pane_of aaaaaaa1)
+  size=$(pane_size "${tp}")
+  settle
+  t0=$(term_winch "${tp}")
+  a0=$(client_winch aaaaaaa1)
+
+  cs_show_session aaaaaaa2 || { fail "switch away failed"; return 1; }
+  settle
+  pane_is_alive "${tp}" || { fail "the terminal died on the switch"; return 1; }
+  if in_main "${tp}"; then
+    fail "the terminal stayed beside another session"
+    return 1
+  fi
+  assert_eq "size while parked" "$(pane_size "${tp}")" "${size}" || return 1
+  assert_eq "SIGWINCH to the terminal, parked" "$(term_winch "${tp}")" "${t0}" || return 1
+  assert_eq "SIGWINCH to the session shown" "$(client_winch aaaaaaa2)" "0" || return 1
+
+  cs_show_session aaaaaaa1 || { fail "switch back failed"; return 1; }
+  settle
+  assert_eq "the same pane" "$(term_pane_of aaaaaaa1)" "${tp}" || return 1
+  in_main "${tp}" || { fail "the terminal did not come back"; return 1; }
+  assert_eq "size after coming back" "$(pane_size "${tp}")" "${size}" || return 1
+  assert_eq "SIGWINCH to the terminal, back" "$(term_winch "${tp}")" "${t0}" || return 1
+  assert_eq "SIGWINCH to its session, back" "$(client_winch aaaaaaa1)" "${a0}"
+}
+
+# Two sessions with the same layout: their terminals trade places, and nothing
+# is resized.
+test_term_same_layout_swap() {
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done idle "beta"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  show_with_terminal aaaaaaa1 bottom || { fail "setup A failed"; return 1; }
+  show_with_terminal aaaaaaa2 bottom || { fail "setup B failed"; return 1; }
+  local ta tb wa ta0 tb0 a0
+  ta=$(term_pane_of aaaaaaa1)
+  tb=$(term_pane_of aaaaaaa2)
+  settle
+  ta0=$(term_winch "${ta}")
+  tb0=$(term_winch "${tb}")
+  a0=$(client_winch aaaaaaa1)
+  # A's terminal is parked now; its window is where B's must end up
+  wa=$(pane_window "${ta}")
+
+  cs_show_session aaaaaaa1 || { fail "switch failed"; return 1; }
+  settle
+  in_main "${ta}" || { fail "A's terminal is not in the main window"; return 1; }
+  assert_eq "B's terminal took A's parking window" "$(pane_window "${tb}")" "${wa}" || return 1
+  assert_eq "SIGWINCH to A's terminal" "$(term_winch "${ta}")" "${ta0}" || return 1
+  assert_eq "SIGWINCH to B's terminal" "$(term_winch "${tb}")" "${tb0}" || return 1
+  assert_eq "SIGWINCH to A's session" "$(client_winch aaaaaaa1)" "${a0}"
+}
+
+# Two sessions with different layouts: the client pane changes size between
+# them, and still neither terminal nor the session shown is sent a SIGWINCH,
+# because nothing is attached while the terminals move. The session being left
+# is not counted: its client dies in the same tmux call.
+test_term_different_layout_switch() {
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done idle "beta"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  show_with_terminal aaaaaaa1 bottom || { fail "setup A failed"; return 1; }
+  show_with_terminal aaaaaaa2 side || { fail "setup B failed"; return 1; }
+  local ta tb sa sb ta0 tb0 a0 b0 client_b client_a
+  ta=$(term_pane_of aaaaaaa1)
+  tb=$(term_pane_of aaaaaaa2)
+  sa=$(pane_size "${ta}")
+  sb=$(pane_size "${tb}")
+  client_b=$(pane_size "${CLIENT_PANE}")
+  settle
+  ta0=$(term_winch "${ta}")
+  tb0=$(term_winch "${tb}")
+  a0=$(client_winch aaaaaaa1)
+  b0=$(client_winch aaaaaaa2)
+
+  cs_show_session aaaaaaa1 || { fail "switch to A failed"; return 1; }
+  settle
+  client_a=$(pane_size "${CLIENT_PANE}")
+  [[ "${client_a}" != "${client_b}" ]] || { fail "the client pane did not change size (${client_a})"; return 1; }
+  in_main "${ta}" || { fail "A's terminal is not in the main window"; return 1; }
+  if in_main "${tb}"; then
+    fail "B's terminal stayed in the main window"
+    return 1
+  fi
+  assert_eq "A's terminal size" "$(pane_size "${ta}")" "${sa}" || return 1
+  assert_eq "B's terminal size, parked" "$(pane_size "${tb}")" "${sb}" || return 1
+  assert_eq "SIGWINCH to A's terminal" "$(term_winch "${ta}")" "${ta0}" || return 1
+  assert_eq "SIGWINCH to B's terminal" "$(term_winch "${tb}")" "${tb0}" || return 1
+  assert_eq "SIGWINCH to A's session" "$(client_winch aaaaaaa1)" "${a0}" || return 1
+
+  cs_show_session aaaaaaa2 || { fail "switch to B failed"; return 1; }
+  settle
+  assert_eq "the client pane, back at B's size" "$(pane_size "${CLIENT_PANE}")" "${client_b}" || return 1
+  assert_eq "B's terminal size, back" "$(pane_size "${tb}")" "${sb}" || return 1
+  assert_eq "SIGWINCH to A's terminal, parked" "$(term_winch "${ta}")" "${ta0}" || return 1
+  assert_eq "SIGWINCH to B's terminal, back" "$(term_winch "${tb}")" "${tb0}" || return 1
+  assert_eq "SIGWINCH to B's session, back" "$(client_winch aaaaaaa2)" "${b0}" || return 1
+
+  # The counters do count: a resize made on purpose reaches both the terminal
+  # and the session beside it.
+  _tmux resize-pane -t "${tb}" -x "$(( ${sb%x*} - 3 ))"
+  settle
+  [[ "$(term_winch "${tb}")" -gt "${tb0}" ]] || { fail "a real resize of the terminal was not counted"; return 1; }
+  [[ "$(client_winch aaaaaaa2)" -gt "${b0}" ]] || { fail "a real resize of the session was not counted"; return 1; }
+}
+
+# A terminal comes back at the size it was parked at, even when that is not what
+# the settings would give: recomputing would resize it on every switch.
+test_term_keeps_its_own_size() {
+  TERMINAL_HEIGHT=15
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done idle "beta"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  show_with_terminal aaaaaaa1 bottom || { fail "setup failed"; return 1; }
+  local tp t0
+  tp=$(term_pane_of aaaaaaa1)
+  assert_eq "height as configured" "$(_tmux display-message -p -t "${tp}" '#{pane_height}')" "15" || return 1
+  # the user drags it taller
+  _tmux resize-pane -t "${tp}" -y 20
+  settle
+  t0=$(term_winch "${tp}")
+  cs_show_session aaaaaaa2 || { fail "switch away failed"; return 1; }
+  cs_show_session aaaaaaa1 || { fail "switch back failed"; return 1; }
+  settle
+  assert_eq "height after coming back" "$(_tmux display-message -p -t "${tp}" '#{pane_height}')" "20" || return 1
+  assert_eq "SIGWINCH to the terminal" "$(term_winch "${tp}")" "${t0}"
+}
+
+# The window changed while a terminal was parked: the size it was parked at is
+# stale, and it comes back at its share of the new window.
+test_term_refit_after_window_change() {
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done idle "beta"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  show_with_terminal aaaaaaa1 side || { fail "setup failed"; return 1; }
+  local tp
+  tp=$(term_pane_of aaaaaaa1)
+  # 120 columns: 89 beside the picker, 45% of that
+  assert_eq "width at 120 columns" "$(_tmux display-message -p -t "${tp}" '#{pane_width}')" "40" || return 1
+  cs_show_session aaaaaaa2 || { fail "switch away failed"; return 1; }
+  _tmux resize-window -t "${PICKER_PANE}" -x 100
+  sleep 0.05
+  cs_handle_winch
+  cs_show_session aaaaaaa1 || { fail "switch back failed"; return 1; }
+  in_main "${tp}" || { fail "the terminal did not come back"; return 1; }
+  # 100 columns: 69 beside the picker
+  assert_eq "width at 100 columns" "$(_tmux display-message -p -t "${tp}" '#{pane_width}')" "31"
+}
+
+# Hiding parks the terminal without resizing it; showing it again brings back
+# the same pane.
+test_term_hide_and_show() {
+  fake_add aaaaaaa1 done idle "alpha"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  show_with_terminal aaaaaaa1 bottom || { fail "setup failed"; return 1; }
+  local tp size t0
+  tp=$(term_pane_of aaaaaaa1)
+  size=$(pane_size "${tp}")
+  settle
+  t0=$(term_winch "${tp}")
+  cs_term_toggle
+  settle
+  [[ ! -f "${STATE_DIR}/term/aaaaaaa1.shown" ]] || { fail "still marked shown after hiding"; return 1; }
+  pane_is_alive "${tp}" || { fail "hiding killed the terminal"; return 1; }
+  if in_main "${tp}"; then
+    fail "still in the main window after hiding"
+    return 1
+  fi
+  assert_eq "size while hidden" "$(pane_size "${tp}")" "${size}" || return 1
+  assert_eq "SIGWINCH on hiding" "$(term_winch "${tp}")" "${t0}" || return 1
+  assert_eq "window name" "$(_tmux display-message -p -t "${tp}" '#{window_name}')" "ca:term" || return 1
+
+  cs_term_toggle
+  settle
+  assert_eq "the same pane" "$(term_pane_of aaaaaaa1)" "${tp}" || return 1
+  in_main "${tp}" || { fail "not back in the main window"; return 1; }
+  assert_eq "size after showing" "$(pane_size "${tp}")" "${size}" || return 1
+  assert_eq "SIGWINCH on showing" "$(term_winch "${tp}")" "${t0}" || return 1
+
+  # hidden stays hidden across a switch
+  fake_add aaaaaaa2 done idle "beta"
+  cs_poll 1
+  cs_term_toggle
+  cs_show_session aaaaaaa2 || { fail "switch away failed"; return 1; }
+  cs_show_session aaaaaaa1 || { fail "switch back failed"; return 1; }
+  if in_main "${tp}"; then
+    fail "a hidden terminal came back on a switch"
+    return 1
+  fi
+}
+
+# Bottom to side: the same terminal, moved.
+test_term_orientation_change() {
+  fake_add aaaaaaa1 done idle "alpha"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  show_with_terminal aaaaaaa1 bottom || { fail "setup failed"; return 1; }
+  local tp
+  tp=$(term_pane_of aaaaaaa1)
+  cs_term_smart side
+  assert_eq "the same pane" "$(term_pane_of aaaaaaa1)" "${tp}" || return 1
+  assert_eq "orientation" "$(cat "${STATE_DIR}/term/aaaaaaa1.orient")" "side" || return 1
+  in_main "${tp}" || { fail "not in the main window"; return 1; }
+  assert_eq "as tall as the client pane" \
+    "$(_tmux display-message -p -t "${tp}" '#{pane_height}')" \
+    "$(_tmux display-message -p -t "${CLIENT_PANE}" '#{pane_height}')" || return 1
+  # the smart key with no orientation keeps the one it has
+  _tmux select-pane -t "${PICKER_PANE}"
+  cs_term_smart
+  assert_eq "orientation kept" "$(cat "${STATE_DIR}/term/aaaaaaa1.orient")" "side" || return 1
+  assert_eq "focus on the terminal" "$(_tmux display-message -p '#{pane_id}')" "${tp}" || return 1
+  cs_term_smart
+  assert_eq "focus back on Claude" "$(_tmux display-message -p '#{pane_id}')" "${CLIENT_PANE}"
+}
+
+# Closing the shell closes the terminal: it is forgotten, and not brought back.
+test_term_shell_exit_forgets() {
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done idle "beta"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  show_with_terminal aaaaaaa1 bottom || { fail "setup failed"; return 1; }
+  _tmux kill-pane -t "$(term_pane_of aaaaaaa1)"
+  cs_tick
+  local n
+  n=$(find "${STATE_DIR}/term" -type f | wc -l | tr -d ' ')
+  assert_eq "state files left" "${n}" "0" || return 1
+  cs_show_session aaaaaaa2 || { fail "switch away failed"; return 1; }
+  cs_show_session aaaaaaa1 || { fail "switch back failed"; return 1; }
+  assert_eq "panes after switching back" "$(_tmux list-panes -a | wc -l | tr -d ' ')" "2"
+}
+
+# Stopping a session keeps its terminal: the session can be opened again.
+# Removing it kills the terminal with it.
+test_term_stop_keeps_remove_kills() {
+  fake_add aaaaaaa1 done idle "alpha"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  show_with_terminal aaaaaaa1 bottom || { fail "setup failed"; return 1; }
+  local tp
+  tp=$(term_pane_of aaaaaaa1)
+  SELECTED=0
+  cs_confirm_end stop "Stop? y/N" <<< "y" > /dev/null
+  pane_is_alive "${tp}" || { fail "stop killed the terminal"; return 1; }
+  assert_eq "still tracked after stop" "$(term_pane_of aaaaaaa1)" "${tp}" || return 1
+  if in_main "${tp}"; then
+    fail "the terminal stayed beside the welcome screen"
+    return 1
+  fi
+  [[ -f "${STATE_DIR}/term/aaaaaaa1.shown" ]] || { fail "stop forgot that the terminal was open"; return 1; }
+
+  cs_confirm_end rm "Remove (stops work)? y/N" <<< "y" > /dev/null
+  if pane_is_alive "${tp}"; then
+    fail "remove left the terminal running"
+    return 1
+  fi
+  local n
+  n=$(find "${STATE_DIR}/term" -type f | wc -l | tr -d ' ')
+  assert_eq "state files left" "${n}" "0"
+}
+
+# A terminal can hold a running process. Its session has to be missing from five
+# successful polls in a row before it is killed; a failed poll does not count.
+test_term_killed_only_when_session_is_gone() {
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done idle "beta"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  show_with_terminal aaaaaaa1 bottom || { fail "setup failed"; return 1; }
+  cs_show_session aaaaaaa2 || { fail "switch failed"; return 1; }
+  local tp i
+  tp=$(term_pane_of aaaaaaa1)
+  fake_drop aaaaaaa1
+  for i in 1 2 3 4; do
+    cs_poll 1 || { fail "poll ${i} failed"; return 1; }
+  done
+  pane_is_alive "${tp}" || { fail "killed after only four polls"; return 1; }
+  touch "${FAKE_CLAUDE_DIR}/fail"
+  cs_poll 1
+  cs_poll 1
+  rm -f "${FAKE_CLAUDE_DIR}/fail"
+  pane_is_alive "${tp}" || { fail "killed on failed polls"; return 1; }
+  cs_poll 1 || { fail "fifth poll failed"; return 1; }
+  if pane_is_alive "${tp}"; then
+    fail "still running after five polls without its session"
+    return 1
+  fi
+  [[ ! -e "${STATE_DIR}/term/aaaaaaa1" ]] || { fail "its state was kept"; return 1; }
+}
+
+# A session opened from agent view brings its terminal with it.
+test_follow_brings_terminal() {
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done idle "beta"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  show_with_terminal aaaaaaa1 bottom || { fail "setup A failed"; return 1; }
+  show_with_terminal aaaaaaa2 side || { fail "setup B failed"; return 1; }
+  local ta tb
+  ta=$(term_pane_of aaaaaaa1)
+  tb=$(term_pane_of aaaaaaa2)
+  # the user goes to agent view and opens A there
+  set_client_title "alpha"
+  cs_tick
+  assert_eq "displayed" "${DISPLAYED}" "aaaaaaa1" || return 1
+  in_main "${ta}" || { fail "A's terminal did not follow"; return 1; }
+  if in_main "${tb}"; then
+    fail "B's terminal stayed"
+    return 1
+  fi
+}
+
+# When the client exits, or the welcome screen is shown, the terminal leaves
+# with the session, and comes back when the session is shown again.
+test_term_leaves_with_its_session() {
+  fake_add aaaaaaa1 done idle "alpha"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  show_with_terminal aaaaaaa1 bottom || { fail "setup failed"; return 1; }
+  local tp
+  tp=$(term_pane_of aaaaaaa1)
+  kill "$(cat "${FAKE_CLAUDE_DIR}/attach.pid")"
+  local i
+  for ((i = 0; i < 40; i++)); do
+    [[ "$(client_title)" == "${CS_T_WELCOME}" ]] && break
+    sleep 0.05
+  done
+  cs_tick
+  assert_eq "displayed after the client exited" "${DISPLAYED}" "" || return 1
+  if in_main "${tp}"; then
+    fail "the terminal stayed after its client exited"
+    return 1
+  fi
+  cs_show_session aaaaaaa1 || { fail "show again failed"; return 1; }
+  in_main "${tp}" || { fail "the terminal did not come back"; return 1; }
+
+  cs_show_welcome
+  if in_main "${tp}"; then
+    fail "the terminal stayed beside the welcome screen"
+    return 1
+  fi
+  pane_is_alive "${tp}" || { fail "the welcome screen killed the terminal"; return 1; }
+}
+
+# A slot is a window pinned to the size of the terminal it is made for. One that
+# a failed switch left behind is swept; a parked terminal is not.
+test_slot_sweep() {
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done idle "beta"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  show_with_terminal aaaaaaa1 bottom || { fail "setup failed"; return 1; }
+  local tp slot
+  tp=$(term_pane_of aaaaaaa1)
+  # made while the terminal is in the main window, at the size it really has
+  cs_refresh_geom
+  slot=$(cs_slot_for "${tp}")
+  [[ -n "${slot}" ]] || { fail "no slot was made"; return 1; }
+  assert_eq "the slot is pinned to the terminal's size" "$(pane_size "${slot}")" "$(pane_size "${tp}")" || return 1
+  # the switch parks the terminal in a slot of its own: the one above is left over
+  cs_show_session aaaaaaa2 || { fail "switch failed"; return 1; }
+  cs_slot_sweep
+  if pane_is_alive "${slot}"; then
+    fail "the slot survived the sweep"
+    return 1
+  fi
+  pane_is_alive "${tp}" || { fail "the sweep killed a parked terminal"; return 1; }
+}
+
+# A fixed-size side terminal is hidden when a resize leaves it no room, and
+# focus goes to Claude if it was in the terminal.
+test_term_fixed_autohide() {
+  TERMINAL_WIDTH=30
+  MIN_CLAUDE_WIDTH=40
+  fake_add aaaaaaa1 done idle "alpha"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  show_with_terminal aaaaaaa1 side || { fail "setup failed"; return 1; }
+  local tp
+  tp=$(term_pane_of aaaaaaa1)
+  assert_eq "width as configured" "$(_tmux display-message -p -t "${tp}" '#{pane_width}')" "30" || return 1
+  [[ ! -f "${STATE_DIR}/term/aaaaaaa1.keep" ]] || { fail ".keep set though it fits"; return 1; }
+  _tmux select-pane -t "${tp}"
+  _tmux resize-window -t "${PICKER_PANE}" -x 100
+  sleep 0.05
+  cs_handle_winch
+  [[ ! -f "${STATE_DIR}/term/aaaaaaa1.shown" ]] || { fail "still shown after the shrink"; return 1; }
+  pane_is_alive "${tp}" || { fail "the terminal was killed, expected parked"; return 1; }
+  assert_eq "focus" "$(_tmux display-message -p '#{pane_id}')" "${CLIENT_PANE}" || return 1
+
+  # reopened without room: squeezed from then on, not hidden again
+  cs_term_smart
+  [[ -f "${STATE_DIR}/term/aaaaaaa1.shown" ]] || { fail "not shown after reopening"; return 1; }
+  [[ -f "${STATE_DIR}/term/aaaaaaa1.keep" ]] || { fail ".keep not set on reopening without room"; return 1; }
+  _tmux resize-window -t "${PICKER_PANE}" -x 95
+  sleep 0.05
+  cs_handle_winch
+  [[ -f "${STATE_DIR}/term/aaaaaaa1.shown" ]] || { fail "hidden again, expected squeezed"; return 1; }
+  assert_eq "Claude keeps its minimum" "$(_tmux display-message -p -t "${CLIENT_PANE}" '#{pane_width}')" "40"
+}
+
+test_term_fixed_autohide_bottom() {
+  TERMINAL_HEIGHT=10
+  MIN_CLAUDE_HEIGHT=20
+  fake_add aaaaaaa1 done idle "alpha"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  show_with_terminal aaaaaaa1 bottom || { fail "setup failed"; return 1; }
+  local tp
+  tp=$(term_pane_of aaaaaaa1)
+  assert_eq "height as configured" "$(_tmux display-message -p -t "${tp}" '#{pane_height}')" "10" || return 1
+  _tmux resize-window -t "${PICKER_PANE}" -y 25
+  sleep 0.05
+  cs_handle_winch
+  [[ ! -f "${STATE_DIR}/term/aaaaaaa1.shown" ]] || { fail "still shown after the shrink"; return 1; }
+  pane_is_alive "${tp}" || { fail "the terminal was killed, expected parked"; return 1; }
+}
+
+# A percentage is squeezed, never hidden.
+test_term_percent_squeeze() {
+  MIN_CLAUDE_WIDTH=30
+  fake_add aaaaaaa1 done idle "alpha"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  show_with_terminal aaaaaaa1 side || { fail "setup failed"; return 1; }
+  assert_eq "saved share" "$(cat "${STATE_DIR}/term/aaaaaaa1.width")" "45%" || return 1
+  _tmux resize-window -t "${PICKER_PANE}" -x 80
+  sleep 0.05
+  cs_handle_winch
+  [[ -f "${STATE_DIR}/term/aaaaaaa1.shown" ]] || { fail "hidden after the shrink; percentages never hide"; return 1; }
+  [[ ! -f "${STATE_DIR}/term/aaaaaaa1.keep" ]] || { fail ".keep set for a percentage"; return 1; }
+  assert_eq "Claude keeps its minimum" "$(_tmux display-message -p -t "${CLIENT_PANE}" '#{pane_width}')" "30" || return 1
+  # hiding it is when its share is saved; a squeezed one is not a share to keep
+  cs_term_toggle
+  assert_eq "the squeezed size is not saved" "$(cat "${STATE_DIR}/term/aaaaaaa1.width")" "45%"
+}
+
+# ── Tests: ported from claude-spaces, for the code copied from it ──
+
+test_display_names_single_path() {
+  REMOTE_SERVERS=()
+  INACTIVE_PROJECTS=()
+  cs_compute_display_names
+  assert_eq "name" "${DISPLAY_NAMES[${PWD}]}" "${PWD##*/}"
+}
+
+test_display_names_different_leaves() {
+  REMOTE_SERVERS=("srv|/home/user/project-a")
+  INACTIVE_PROJECTS=("san|/home/user/project-b")
+  cs_compute_display_names
+  assert_eq "a" "${DISPLAY_NAMES[/home/user/project-a]}" "project-a" || return 1
+  assert_eq "b" "${DISPLAY_NAMES[/home/user/project-b]}" "project-b"
+}
+
+test_display_names_same_leaf_different_parent() {
+  REMOTE_SERVERS=("srv|/home/user/client-a/api")
+  INACTIVE_PROJECTS=("san|/home/user/client-b/api")
+  cs_compute_display_names
+  assert_eq "a" "${DISPLAY_NAMES[/home/user/client-a/api]}" "client-a/api" || return 1
+  assert_eq "b" "${DISPLAY_NAMES[/home/user/client-b/api]}" "client-b/api"
+}
+
+test_display_names_deep_divergence() {
+  REMOTE_SERVERS=("srv|/home/user/aaaa/otherwise/same/but/very/long/path/my-project")
+  INACTIVE_PROJECTS=("san|/home/user/bbbb/otherwise/same/but/very/long/path/my-project")
+  cs_compute_display_names
+  assert_eq "a" "${DISPLAY_NAMES[/home/user/aaaa/otherwise/same/but/very/long/path/my-project]}" "aaaa/.../my-project" || return 1
+  assert_eq "b" "${DISPLAY_NAMES[/home/user/bbbb/otherwise/same/but/very/long/path/my-project]}" "bbbb/.../my-project"
+}
+
+test_display_names_three_way_collision() {
+  REMOTE_SERVERS=("s1|/home/user/aaaa/foo/bar" "s2|/home/user/bbbb/foo/bar")
+  INACTIVE_PROJECTS=("san|/home/user/bbbb/baz/bar")
+  cs_compute_display_names
+  assert_eq "a" "${DISPLAY_NAMES[/home/user/aaaa/foo/bar]}" "aaaa/.../bar" || return 1
+  assert_eq "b" "${DISPLAY_NAMES[/home/user/bbbb/foo/bar]}" "bbbb/foo/bar" || return 1
+  assert_eq "c" "${DISPLAY_NAMES[/home/user/bbbb/baz/bar]}" "bbbb/baz/bar"
+}
+
+test_display_names_compression() {
+  assert_eq "1 component" "$(cs_compress_suffix "my-project")" "my-project" || return 1
+  assert_eq "2 components" "$(cs_compress_suffix "client-a/api")" "client-a/api" || return 1
+  assert_eq "4 components" "$(cs_compress_suffix "aaaa/otherwise/same/my-project")" "aaaa/.../my-project"
+}
+
+# Launched through a symlink, the project is still found: Claude reports the
+# real path of a session's directory.
+test_symlinked_cwd_finds_sessions() {
+  local real_dir="${TEST_TMP}/real-project" link_dir="${TEST_TMP}/link-project"
+  mkdir -p "${real_dir}"
+  ln -snf "${real_dir}" "${link_dir}"
+  local real_canonical saved_pwd="${PWD}" saved_cwd
+  real_canonical=$(cd "${real_dir}" && pwd -P)
+  saved_cwd=$(command pwd)
+  fake_add aaaaaaa1 done idle "through the link" "${real_canonical}"
+  cd "${link_dir}" || return 1
+  cs_normalize_pwd
+  local rc=0
+  assert_eq "PWD normalized" "${PWD}" "${real_canonical}" || rc=1
+  cs_poll 1 || rc=1
+  cs_rescan
+  assert_eq "listed" "${ENTRIES_ID[*]} ${ENTRIES_TYPE[*]}" "aaaaaaa1 local" || rc=1
+  cd "${saved_cwd}" || return 1
+  PWD="${saved_pwd}"
+  rm -rf "${real_dir}" "${link_dir}"
+  return ${rc}
+}
+
+test_out_var_helpers() {
+  local age idx fp pair
+  NOW=1000000
+  for pair in "30 <1m" "300 5m" "10800 3h" "172800 2d" "604800 1w"; do
+    cs_format_age "$((NOW - ${pair%% *}))" age
+    assert_eq "format_age ${pair%% *}s" "${age}" "${pair#* }" || return 1
+  done
+  cs_entry_clear
+  cs_entry_append "x" "" "0" "" "" "local" ""
+  cs_entry_append "y" "" "0" "" "" "local" ""
+  cs_find_entry_index "y" idx
+  assert_eq "find_entry_index hit" "${idx}" "1" || return 1
+  cs_find_entry_index "z" idx
+  assert_eq "find_entry_index miss" "${idx}" "-1" || return 1
+  cs_fingerprint fp
+  [[ "${fp}" == focus:* ]] || { fail "fingerprint: got '${fp}'"; return 1; }
+}
+
+test_sort_memo() {
+  local lines=("3 1 beta" "1 0 alpha" "2 1 alpha" "0 1 -n flag" "4 0 back\\slash" "5 1   spaced  out" "6 1 ünïcode" "8 1 _under" "9 1 a-b")
+  local in="" l out expect
+  for l in "${lines[@]}"; do in+="${in:+$'\n'}${l}"; done
+
+  expect=$(printf '%s\n' "${lines[@]}" | sort -t' ' -k2,2 -k3)
+  cs_sort_memo out t "${in}" -t' ' -k2,2 -k3
+  [[ "${out}" == "${expect}" ]] || { fail "miss: output differs from sort"; return 1; }
+
+  # served from the memo (tampered to prove sort didn't run)
+  SORT_MEMO_OUT[t]="from-memo"
+  cs_sort_memo out t "${in}" -t' ' -k2,2 -k3
+  assert_eq "hit" "${out}" "from-memo" || return 1
+
+  expect=$(printf '%s\n' "${lines[@]}" "7 0 aaa" | sort -t' ' -k2,2 -k3)
+  cs_sort_memo out t "${in}"$'\n'"7 0 aaa" -t' ' -k2,2 -k3
+  [[ "${out}" == "${expect}" ]] || { fail "changed input: not recomputed"; return 1; }
+
+  local nums=("100 0" "300 1" "300 2" "50 3" "300 10")
+  in=""
+  for l in "${nums[@]}"; do in+="${in:+$'\n'}${l}"; done
+  expect=$(printf '%s\n' "${nums[@]}" | sort -rnk1)
+  cs_sort_memo out n "${in}" -rnk1
+  [[ "${out}" == "${expect}" ]] || { fail "numeric: output differs from sort"; return 1; }
+}
+
+# One tmux call gives the live panes, the picker's focus, the number of attached
+# clients and the client pane's title.
+test_pane_cache() {
+  local plain direct
+  plain=$(_tmux list-panes -a -F '#{pane_id}')
+  direct=$(_tmux display-message -t "${PICKER_PANE}" -p '#{pane_active}')
+  set_client_title "some title: with spaces"
+
+  cs_refresh_pane_cache
+  assert_eq "live panes" "${LIVE_PANES}" "${plain}" || return 1
+  assert_eq "picker focus" "${PICKER_ACTIVE}" "${direct}" || return 1
+  assert_eq "client title" "${CLIENT_TITLE}" "some title: with spaces" || return 1
+  assert_eq "attached clients" "${SESSION_ATTACHED}" "0" || return 1
+
+  local saved="${PICKER_PANE}"
+  PICKER_PANE=""
+  cs_refresh_pane_cache
+  PICKER_PANE="${saved}"
+  assert_eq "live panes, no picker yet" "${LIVE_PANES}" "${plain}" || return 1
+  assert_eq "picker focus, no picker yet" "${PICKER_ACTIVE}" "" || return 1
+
+  PICKER_PANE="%999999"
+  cs_refresh_pane_cache
+  PICKER_PANE="${saved}"
+  assert_eq "live panes, dead picker" "${LIVE_PANES}" "${plain}" || return 1
+  assert_eq "picker focus, dead picker" "${PICKER_ACTIVE}" "" || return 1
+
+  # a dead client pane has no title: tmux must not answer for another pane
+  local saved_client="${CLIENT_PANE}"
+  CLIENT_PANE="%999999"
+  cs_refresh_pane_cache
+  CLIENT_PANE="${saved_client}"
+  assert_eq "title of a dead client pane" "${CLIENT_TITLE}" ""
+}
+
+# Nobody attached: the list is not refreshed. It is, at once, when someone is.
+test_poll_only_while_attached() {
+  fake_add aaaaaaa1 done idle "alpha"
+  SESSION_ATTACHED=0
+  cs_poll_tick
+  assert_eq "polled while detached" "${POLLED}" "0" || return 1
+  SESSION_ATTACHED=1
+  cs_poll_tick
+  assert_eq "polled once attached" "${POLLED}" "1" || return 1
+  assert_eq "listed" "${AG_IDS[*]}" "aaaaaaa1" || return 1
+  # and not again before the interval is up
+  POLL_INTERVAL=3600
+  fake_add aaaaaaa2 done idle "beta"
+  cs_poll_tick
+  assert_eq "polled again too early" "${AG_IDS[*]}" "aaaaaaa1"
+}
+
+# Another picker refreshed the shared cache moments ago: use it instead of
+# asking Claude again. A forced refresh always asks.
+test_poll_cache_shared() {
+  fake_add aaaaaaa1 done idle "alpha"
+  POLL_INTERVAL=3600
+  cs_poll 1 || { fail "first poll failed"; return 1; }
+  [[ -s "${CS_STATE_ROOT}/agents.json" ]] || { fail "no cache written"; return 1; }
+  fake_add aaaaaaa2 done idle "beta"
+  cs_poll || { fail "poll from the cache failed"; return 1; }
+  assert_eq "from the cache" "${AG_IDS[*]}" "aaaaaaa1" || return 1
+  cs_poll 1 || { fail "forced poll failed"; return 1; }
+  assert_eq "forced" "${AG_IDS[*]}" "aaaaaaa1 aaaaaaa2"
+}
+
+test_read_state_into() {
+  local v rc
+  printf 'a\nb\n\n' > "${STATE_DIR}/rsi_multi"
+  rm -f "${STATE_DIR}/rsi_missing"
+  cs_read_state_into v rsi_multi
+  [[ "${v}" == $'a\nb' ]] || { fail "present: got '${v}'"; return 1; }
+  cs_read_state_into v rsi_missing
+  [[ -z "${v}" ]] || { fail "missing: stale value kept: '${v}'"; return 1; }
+  v=$(cs_read_state rsi_multi); rc=$?
+  [[ "${v}" == $'a\nb' && ${rc} -eq 0 ]] || { fail "cs_read_state present: '${v}' rc=${rc}"; return 1; }
+  v=$(cs_read_state rsi_missing); rc=$?
+  [[ -z "${v}" && ${rc} -eq 0 ]] || { fail "cs_read_state missing: '${v}' rc=${rc}"; return 1; }
+  rm -f "${STATE_DIR}/rsi_multi"
+}
+
+# The welcome and client scripts are written with the project's name and path in
+# them. Neither may be run as code.
+test_scripts_injection_safe() {
+  local marker="${TEST_TMP}/SCRIPT_PWNED"
+  local saved_pwd="${PWD}" saved_san="${PWD_SANITIZED}"
+  # a project name that closes the echo string and runs a command
+  PROJECT_NAMES[${PWD_SANITIZED}]='x"; touch '"'${marker}.name'"'; echo "'
+  # and a project directory whose name does the same to `cd`
+  local evil="${TEST_TMP}/evil \$(touch ${marker}.path); \`touch ${marker}.tick\`"
+  mkdir -p "${evil}"
+  PWD="${evil}"
+  cs_client_write_scripts
+  PWD="${saved_pwd}"
+  PWD_SANITIZED="${saved_san}"
+  fake_add aaaaaaa1 done idle "alpha"
+  cs_poll 1
+  cs_show_welcome
+  sleep 0.3
+  cs_show_session aaaaaaa1
+  sleep 0.4
+  unset "PROJECT_NAMES[${PWD_SANITIZED}]"
+  local leaked=""
+  [[ -e "${marker}.name" ]] && leaked+="name "
+  [[ -e "${marker}.path" ]] && leaked+="path "
+  [[ -e "${marker}.tick" ]] && leaked+="backtick "
+  # put the real scripts back for the tests that follow
+  cs_client_write_scripts
+  cs_show_welcome
+  rm -rf "${evil}" "${marker}".*
+  assert_eq "ran as code" "${leaked}" ""
+}
+
+test_config_injection_safe() {
+  local marker="${TEST_TMP}/PWNED_CONFIG"
+  # bash arithmetic evaluates recursively: a[$(cmd)] runs cmd when the value is
+  # later used in $((...))
+  local key
+  for key in recent_threshold poll_interval min_claude_width min_claude_height show_index; do
+    echo "${key}=a[\$(>${marker}.${key})]" >> "${CONFIG_FILE}"
+  done
+  echo "terminal_height=a[\$(>${marker}.th)]" >> "${CONFIG_FILE}"
+  echo "picker_width=a[\$(>${marker}.pw)]" >> "${CONFIG_FILE}"
+  cs_load_config 2>/dev/null
+  : $((RECENT_THRESHOLD + POLL_INTERVAL + MIN_CLAUDE_WIDTH + MIN_CLAUDE_HEIGHT + SHOW_INDEX))
+  [[ "${TERMINAL_HEIGHT}" == *% ]] || : $((TERMINAL_HEIGHT + 0))
+  local fired
+  fired=$(find "${TEST_TMP}" -maxdepth 1 -name 'PWNED_CONFIG.*' | wc -l | tr -d ' ')
+  rm -f "${marker}".*
+  assert_eq "config values run as code" "${fired}" "0"
+}
+
+# The keys that only this tool has are read, and validated.
+test_config_keys() {
+  cat > "${CONFIG_FILE}" << 'EOF'
+poll_interval=7
+terminal_height=12
+terminal_width=30%
+min_claude_width=44
+min_claude_height=9
+EOF
+  cs_load_config 2>/dev/null
+  assert_eq "poll_interval" "${POLL_INTERVAL}" "7" || return 1
+  assert_eq "terminal_height" "${TERMINAL_HEIGHT}" "12" || return 1
+  assert_eq "terminal_width" "${TERMINAL_WIDTH}" "30%" || return 1
+  assert_eq "min_claude_width" "${MIN_CLAUDE_WIDTH}" "44" || return 1
+  assert_eq "min_claude_height" "${MIN_CLAUDE_HEIGHT}" "9" || return 1
+  cat > "${CONFIG_FILE}" << 'EOF'
+poll_interval=fast
+terminal_height=tall
+EOF
+  cs_load_config 2>/dev/null
+  assert_eq "a bad poll_interval is ignored" "${POLL_INTERVAL}" "7" || return 1
+  assert_eq "a bad terminal_height is ignored" "${TERMINAL_HEIGHT}" "12"
+}
+
+test_state_root_symlink_guard() {
+  local fake_target="${TEST_TMP}/legitdir" symlink_path="${TEST_TMP}/state-root-symlink"
+  mkdir -p "${fake_target}"
+  ln -s "${fake_target}" "${symlink_path}"
+  # in a subshell so its exit doesn't kill the test runner
+  local exit_code=0
+  ( CS_STATE_ROOT="${symlink_path}"; cs_init_state ) >/dev/null 2>&1 || exit_code=$?
+  rm -f "${symlink_path}"
+  rm -rf "${fake_target}"
+  [[ ${exit_code} -ne 0 ]] || { fail "cs_init_state did not reject a symlinked state root"; return 1; }
+}
+
+test_config_state_root() {
+  local orig_root="${CS_STATE_ROOT}" custom="${TEST_TMP}/custom-state"
+  echo "state_root=${custom}" > "${CONFIG_FILE}"
+  cs_load_config 2>/dev/null
+  assert_eq "applied" "${CS_STATE_ROOT}" "${custom}" || return 1
+  echo "state_root=${custom}/" > "${CONFIG_FILE}"
+  CS_STATE_ROOT="${orig_root}"
+  cs_load_config 2>/dev/null
+  assert_eq "trailing slash stripped" "${CS_STATE_ROOT}" "${custom}" || return 1
+  echo "state_root=~/some-state" > "${CONFIG_FILE}"
+  CS_STATE_ROOT="${orig_root}"
+  cs_load_config 2>/dev/null
+  assert_eq "~/ expanded" "${CS_STATE_ROOT}" "${HOME}/some-state" || return 1
+  echo "state_root=relative/path" > "${CONFIG_FILE}"
+  CS_STATE_ROOT="${orig_root}"
+  cs_load_config 2>/dev/null
+  assert_eq "relative rejected" "${CS_STATE_ROOT}" "${orig_root}" || return 1
+  echo "state_root=${HOME}" > "${CONFIG_FILE}"
+  CS_STATE_ROOT="${orig_root}"
+  cs_load_config 2>/dev/null
+  assert_eq "\$HOME rejected" "${CS_STATE_ROOT}" "${orig_root}"
+}
+
+test_config_tmux_conf_tilde() {
+  local orig_conf="${TMUX_CONF}" rc=0
+  echo "tmux_conf=~/.tmux.conf" > "${CONFIG_FILE}"
+  cs_load_config 2>/dev/null
+  assert_eq "~/ expanded" "${TMUX_CONF}" "${HOME}/.tmux.conf" || rc=1
+  echo "tmux_conf=/etc/tmux.conf" > "${CONFIG_FILE}"
+  cs_load_config 2>/dev/null
+  assert_eq "absolute path untouched" "${TMUX_CONF}" "/etc/tmux.conf" || rc=1
+  TMUX_CONF="${orig_conf}"
+  return ${rc}
+}
+
+# The focus hooks carry the state dir's path. It must reach the shell as data.
+test_hook_injection_safe() {
+  local marker="${TEST_TMP}/PWNED_HOOK"
+  local orig_state="${STATE_DIR}"
+  STATE_DIR="${TEST_TMP}/state-\$(touch ${marker})"
+  mkdir -p "${STATE_DIR}"
+  cs_install_focus_hook
+  local hooks
+  hooks=$(_tmux show-hooks -g 2>/dev/null)
+  cs_remove_focus_hook
+  rm -rf "${STATE_DIR}"
+  STATE_DIR="${orig_state}"
+  if [[ "${hooks}" == *"touch ${marker}"* ]]; then
+    fail "the hook string contains the raw payload"
+    return 1
+  fi
+  [[ ! -e "${marker}" ]] || { fail "the payload ran while the hook was installed"; return 1; }
+}
+
+# ── Tests: launcher ──────────────────────────────
+
+test_version_check() {
+  cs_version_ge 2.1.325 2.1.325 || { fail "equal versions"; return 1; }
+  cs_version_ge 2.2.0 2.1.325 || { fail "newer minor"; return 1; }
+  cs_version_ge 3.0.0 2.1.325 || { fail "newer major"; return 1; }
+  if cs_version_ge 2.1.324 2.1.325; then fail "older patch accepted"; return 1; fi
+  if cs_version_ge 2.1.99 2.1.325; then fail "2.1.99 accepted as newer than 2.1.325"; return 1; fi
+  if cs_version_ge "" 2.1.325; then fail "empty version accepted"; return 1; fi
+  if cs_version_ge "garbage" 2.1.325; then fail "garbage accepted"; return 1; fi
+}
+
+test_preflight_claude() {
+  cs_preflight_claude > /dev/null || { fail "preflight failed against the fake"; return 1; }
+  touch "${FAKE_CLAUDE_DIR}/fail"
+  local out
+  if out=$(cs_preflight_claude); then
+    fail "preflight passed although the list cannot be read"
+    return 1
+  fi
+  [[ "${out}" == *"simulated failure"* ]] || { fail "Claude's message is not shown: ${out}"; return 1; }
+}
+
+# The real script, in a terminal: it builds the window, lists the sessions,
+# survives a detach, and is attached to again without a second server.
+test_e2e_launch_detach_reattach() {
+  fake_add aaaaaaa1 done idle "Fix the login bug" "$(e2e_project a)"
+  e2e_launch a
+  e2e_wait_up a || { fail "the picker never came up: $(e2e_outer_text | tail -3)"; return 1; }
+  local inner st panes
+  inner=$(e2e_inner a)
+  st=$(e2e_state a)
+  panes=$(tmux -L "${inner}" list-panes -a | wc -l | tr -d ' ')
+  assert_eq "panes" "${panes}" "2" || return 1
+  local i
+  for ((i = 0; i < 40; i++)); do
+    e2e_picker_text a | grep -q "Fix the login bug" && break
+    sleep 0.1
+  done
+  e2e_picker_text a | grep -q "Fix the login bug" || { fail "the session is not listed"; return 1; }
+  assert_eq "picker width" "$(tmux -L "${inner}" display-message -p -t "$(cat "${st}/picker_pane")" '#{pane_width}')" "30" || return 1
+  assert_eq "title recording is on" "$(tmux -L "${inner}" show -gwv allow-set-title)" "on" || return 1
+
+  # Enter shows the session
+  e2e_keys a Enter
+  wait_for "${FAKE_CLAUDE_DIR}/attach.log" || { fail "Enter did not show the session"; return 1; }
+  assert_eq "displayed" "$(cat "${st}/displayed")" "aaaaaaa1" || return 1
+
+  local picker
+  picker=$(cat "${st}/picker_pane")
+  tmux -L "${inner}" select-pane -t "${picker}"
+  e2e_keys a Q
+  e2e_wait_outer "launcher exit=0" || { fail "the launcher did not exit on detach"; return 1; }
+  tmux -L "${inner}" has-session 2>/dev/null || { fail "detaching ended the server"; return 1; }
+
+  e2e_launch a
+  for ((i = 0; i < 50; i++)); do
+    [[ "$(tmux -L "${inner}" list-clients 2>/dev/null | wc -l | tr -d ' ')" == "1" ]] && break
+    sleep 0.1
+  done
+  assert_eq "clients after relaunch" "$(tmux -L "${inner}" list-clients | wc -l | tr -d ' ')" "1" || return 1
+  assert_eq "the same picker pane" "$(cat "${st}/picker_pane")" "${picker}" || return 1
+  assert_eq "still displayed" "$(cat "${st}/displayed")" "aaaaaaa1"
+}
+
+# The prefix table: the keys this tool binds, and none it should not.
+test_e2e_prefix_table() {
+  e2e_launch a
+  e2e_wait_up a || { fail "the picker never came up"; return 1; }
+  local keys
+  keys=$(tmux -L "$(e2e_inner a)" list-keys -T prefix | sed 's/  */ /g')
+  local want
+  for want in 'prefix v send-keys' 'prefix x send-keys' 'prefix D send-keys' 'prefix c send-keys' \
+              'prefix ` send-keys' 'prefix Tab send-keys' 'prefix q send-keys' 'prefix t send-keys'; do
+    [[ "${keys}" == *"${want}"* ]] || { fail "not bound: ${want}"; return 1; }
+  done
+  [[ "${keys}" == *'prefix a send-keys `'* ]] || { fail "prefix a is not the literal grave"; return 1; }
+  if [[ "${keys}" == *"prefix f "* ]]; then
+    fail "prefix f is still bound"
+    return 1
+  fi
+}
+
+# A Claude that cannot list sessions: say so, and start nothing.
+test_e2e_preflight_refuses() {
+  touch "${FAKE_CLAUDE_DIR}/fail"
+  e2e_launch a
+  e2e_wait_outer "launcher exit=1" || { fail "the launcher did not refuse: $(e2e_outer_text | tail -3)"; return 1; }
+  e2e_outer_text | grep -q "simulated failure" || { fail "Claude's message is not shown"; return 1; }
+  if tmux -L "$(e2e_inner a)" has-session 2>/dev/null; then
+    fail "a server was started anyway"
+    return 1
+  fi
+}
+
+# New code in front of an old server: the picker stops the server and the
+# launcher explains, instead of running against a layout it did not build.
+test_e2e_compat_gate() {
+  e2e_launch a
+  e2e_wait_up a || { fail "the picker never came up"; return 1; }
+  echo "0" > "$(e2e_state a)/compat_version"
+  e2e_keys a R
+  e2e_wait_outer "layout changed" || { fail "the launcher did not explain: $(e2e_outer_text | tail -3)"; return 1; }
+  if tmux -L "$(e2e_inner a)" has-session 2>/dev/null; then
+    fail "the old server is still running"
+    return 1
+  fi
+  [[ ! -f "$(e2e_state a)/restart_required" ]] || { fail "the marker was not consumed"; return 1; }
+}
+
+# Parking with a real client attached. A new window takes the client's size, so
+# the slot has to be pinned for the terminal to move into it without a resize.
+# A resize of the real terminal afterwards does not reach a parked terminal.
+test_e2e_parking_keeps_terminal_size() {
+  fake_add aaaaaaa1 done idle "Alpha" "$(e2e_project a)"
+  fake_add aaaaaaa2 done idle "Beta" "$(e2e_project a)"
+  e2e_launch a
+  e2e_wait_up a || { fail "the picker never came up"; return 1; }
+  local inner st i first tp size
+  inner=$(e2e_inner a)
+  st=$(e2e_state a)
+  for ((i = 0; i < 40; i++)); do
+    e2e_picker_text a | grep -q "Beta" && break
+    sleep 0.1
+  done
+  # show the first row's session and open its terminal
+  e2e_keys a Enter
+  for ((i = 0; i < 40; i++)); do
+    [[ -s "${st}/displayed" ]] && break
+    sleep 0.1
+  done
+  first=$(cat "${st}/displayed")
+  [[ -n "${first}" ]] || { fail "Enter showed nothing"; return 1; }
+  e2e_keys a '`'
+  wait_for "${st}/term/${first}" || { fail "the terminal key opened nothing"; return 1; }
+  tp=$(cat "${st}/term/${first}")
+  sleep 0.3
+  size=$(tmux -L "${inner}" display-message -p -t "${tp}" '#{pane_width}x#{pane_height}')
+  # the other session: the terminal is parked
+  e2e_keys a j Enter
+  for ((i = 0; i < 40; i++)); do
+    [[ "$(cat "${st}/displayed")" != "${first}" ]] && break
+    sleep 0.1
+  done
+  [[ "$(cat "${st}/displayed")" != "${first}" ]] || { fail "the second session was not shown"; return 1; }
+  sleep 0.3
+  local main_win
+  main_win=$(tmux -L "${inner}" display-message -p -t "$(cat "${st}/picker_pane")" '#{window_id}')
+  [[ "$(tmux -L "${inner}" display-message -p -t "${tp}" '#{window_id}')" != "${main_win}" ]] \
+    || { fail "the terminal was not parked"; return 1; }
+  assert_eq "the terminal's size once parked" \
+    "$(tmux -L "${inner}" display-message -p -t "${tp}" '#{pane_width}x#{pane_height}')" "${size}" || return 1
+
+  tmux -L "${E2E_OUTER}" resize-window -t o -x 110 -y 32
+  for ((i = 0; i < 40; i++)); do
+    [[ "$(tmux -L "${inner}" display-message -p -t "$(cat "${st}/picker_pane")" '#{window_width}')" == "110" ]] && break
+    sleep 0.1
+  done
+  assert_eq "the resize reached the view" \
+    "$(tmux -L "${inner}" display-message -p -t "$(cat "${st}/picker_pane")" '#{window_width}')" "110" || return 1
+  sleep 0.3
+  assert_eq "the parked terminal's size after the real terminal was resized" \
+    "$(tmux -L "${inner}" display-message -p -t "${tp}" '#{pane_width}x#{pane_height}')" "${size}"
+}
+
+# Selecting another project's session hops to that project's own view, which is
+# started for the occasion, and shows the session there.
+test_e2e_hop() {
+  fake_add bbbbbbb1 done idle "Over there" "$(e2e_project b)"
+  e2e_launch a
+  e2e_wait_up a || { fail "the picker never came up"; return 1; }
+  local i
+  for ((i = 0; i < 40; i++)); do
+    e2e_picker_text a | grep -q "Over there" && break
+    sleep 0.1
+  done
+  e2e_picker_text a | grep -q "Over there" || { fail "the other project's session is not listed"; return 1; }
+  # the cursor starts on the project row; the session is the next one
+  e2e_keys a j Enter
+  e2e_wait_up b || { fail "the other project's view never came up: $(e2e_outer_text | tail -3)"; return 1; }
+  local stb
+  stb=$(e2e_state b)
+  for ((i = 0; i < 60; i++)); do
+    [[ "$(cat "${stb}/displayed" 2>/dev/null)" == "bbbbbbb1" ]] && break
+    sleep 0.1
+  done
+  assert_eq "displayed in the other project" "$(cat "${stb}/displayed" 2>/dev/null)" "bbbbbbb1" || return 1
+  assert_eq "attached" "$(tail -1 "${FAKE_CLAUDE_DIR}/attach.log")" "bbbbbbb1" || return 1
+  [[ ! -f "${stb}/pending_load" ]] || { fail "pending_load was not consumed"; return 1; }
+  [[ ! -f "$(e2e_state a)/switch_target" ]] || { fail "switch_target was not consumed"; return 1; }
+  tmux -L "$(e2e_inner a)" has-session 2>/dev/null || { fail "the first project's server was ended by the hop"; return 1; }
+}
+
+# ── Main ─────────────────────────────────────────
+main() {
+  echo "claude-agents tests"
+  echo "══════════════════════════════════"
+  echo ""
+
+  if [[ -z "${ONLY}" ]]; then
+    phase_shellcheck
+    phase_arg_checks
+  fi
+
+  echo "Loading functions..."
+  CS_TESTING=1
+  load_functions
+  echo "Setting up test environment..."
+  cs_test_setup
+  trap cs_test_teardown EXIT
+  echo ""
+  echo "Running tests:"
+
+  run_test "background sessions only"       test_list_background_only
+  run_test "this project"                   test_list_this_project
+  run_test "ids validated"                  test_ids_validated
+  run_test "name control chars stripped"    test_name_control_chars_stripped
+  run_test "poll failure keeps list"        test_poll_failure_keeps_list
+  run_test "order and names"                test_order_and_names
+  run_test "other projects rows"            test_other_projects_rows
+  run_test "jump slots"                     test_jump_slots
+  run_test "row look"                       test_row_look
+
+  run_test "invariant check notices"        test_invariant_check_notices
+
+  run_test "switch runs client"             test_switch_runs_client_and_sets_state
+  run_test "switch chain order"             test_switch_chain_order
+  run_test "switch refuses bad id"          test_switch_refuses_bad_id
+  run_test "switch does not re-adopt"       test_switch_no_readopt
+  run_test "empty client target refused"    test_empty_client_target_refused
+  run_test "switch failure ends on welcome" test_switch_failure_ends_on_welcome
+  run_test "follow title mapping"           test_follow_title_mapping
+  run_test "agent view keeps displayed"     test_agents_view_keeps_displayed
+  run_test "client exit clears displayed"   test_client_exit_clears_displayed
+  run_test "reload keeps shown"             test_reload_keeps_shown
+  run_test "client pane recreated"          test_client_pane_recreated
+  run_test "switch recreates dead client"   test_switch_recreates_dead_client
+
+  run_test "new session waits for id"       test_new_session_waits_for_id
+  run_test "new session id from list"       test_new_session_id_from_list
+  run_test "new session failure reported"   test_new_session_failure_reported
+  run_test "untrusted opens agent view"     test_new_session_untrusted_opens_agents
+  run_test "untouched cleanup guard"        test_untouched_cleanup_guard
+  run_test "stop shows feedback"            test_stop_shows_feedback
+  run_test "remove drops the row"           test_remove_drops_the_row
+  run_test "prefix stop targets shown"      test_prefix_stop_targets_shown
+  run_test "shutdown prompt"                test_shutdown_prompt
+
+  run_test "footer note"                    test_footer_note
+  run_test "empty list note"                test_empty_list_note
+
+  run_test "unseen rules"                   test_unseen_rules
+  run_test "mark seen clears unseen"        test_mark_seen_clears_unseen
+  run_test "seen needs window focus"        test_seen_needs_window_focus
+  run_test "seen sweep"                     test_seen_sweep
+
+  run_test "hop writes switch_target"       test_hop_writes_switch_target
+  run_test "pending_load shows session"     test_pending_load_shows_session
+
+  run_test "term opens in session cwd"      test_term_opens_in_session_cwd
+  run_test "term keys need a session"       test_term_keys_need_a_session
+  run_test "term survives switch"           test_term_survives_switch
+  run_test "term same layout swap"          test_term_same_layout_swap
+  run_test "term different layout switch"   test_term_different_layout_switch
+  run_test "term keeps its own size"        test_term_keeps_its_own_size
+  run_test "term refit after window change" test_term_refit_after_window_change
+  run_test "term hide and show"             test_term_hide_and_show
+  run_test "term orientation change"        test_term_orientation_change
+  run_test "term shell exit forgets"        test_term_shell_exit_forgets
+  run_test "term stop keeps, remove kills"  test_term_stop_keeps_remove_kills
+  run_test "term killed only when gone"     test_term_killed_only_when_session_is_gone
+  run_test "follow brings terminal"         test_follow_brings_terminal
+  run_test "term leaves with its session"   test_term_leaves_with_its_session
+  run_test "slot sweep"                     test_slot_sweep
+  run_test "term fixed autohide"            test_term_fixed_autohide
+  run_test "term fixed autohide bottom"     test_term_fixed_autohide_bottom
+  run_test "term percent squeeze"           test_term_percent_squeeze
+
+  run_test "display names: single"          test_display_names_single_path
+  run_test "display names: diff leaves"     test_display_names_different_leaves
+  run_test "display names: same leaf"       test_display_names_same_leaf_different_parent
+  run_test "display names: deep div"        test_display_names_deep_divergence
+  run_test "display names: three-way"       test_display_names_three_way_collision
+  run_test "display names: compression"     test_display_names_compression
+  run_test "symlinked cwd finds sessions"   test_symlinked_cwd_finds_sessions
+  run_test "out-var helpers"                test_out_var_helpers
+  run_test "sort memo"                      test_sort_memo
+  run_test "pane cache"                     test_pane_cache
+  run_test "poll only while attached"       test_poll_only_while_attached
+  run_test "poll cache shared"              test_poll_cache_shared
+  run_test "read state into"                test_read_state_into
+  run_test "scripts injection safe"         test_scripts_injection_safe
+  run_test "config injection safe"          test_config_injection_safe
+  run_test "config keys"                    test_config_keys
+  run_test "state root symlink guard"       test_state_root_symlink_guard
+  run_test "state root config key"          test_config_state_root
+  run_test "tmux_conf tilde expansion"      test_config_tmux_conf_tilde
+  run_test "hook injection safe"            test_hook_injection_safe
+
+  run_test "version check"                  test_version_check
+  run_test "preflight claude"               test_preflight_claude
+  run_test "launch, detach, re-attach"      test_e2e_launch_detach_reattach
+  run_test "prefix table"                   test_e2e_prefix_table
+  run_test "preflight refuses"              test_e2e_preflight_refuses
+  run_test "compatibility gate"             test_e2e_compat_gate
+  run_test "parking keeps terminal size"    test_e2e_parking_keeps_terminal_size
+  run_test "hop to another project"         test_e2e_hop
+
+  echo ""
+  echo "══════════════════════════════════"
+  echo -e "${PASS_COUNT} ${GREEN}passed${RESET}, ${FAIL_COUNT} ${RED}failed${RESET}"
+  if [[ -n "${ONLY}" ]] && ((PASS_COUNT + FAIL_COUNT == 0)); then
+    echo -e "${RED}no test named ${ONLY}${RESET}"
+    return 1
+  fi
+  ((FAIL_COUNT == 0))
+}
+
+main "$@"

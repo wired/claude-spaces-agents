@@ -1,0 +1,3452 @@
+#!/usr/bin/env bash
+# ══════════════════════════════════════════════════
+# claude-agents — tmux picker for Claude Code background sessions
+# Version 0.1.0-dev
+#
+# Copyright (c) 2026 Alex Alexander <alex.alexander@gmail.com>
+# Licensed under MIT
+# ══════════════════════════════════════════════════
+#
+# Prototype, forked from claude-spaces. Design: specs/claude-agents.md
+#
+# Usage:
+#   claude-agents          Launch picker (inside or outside tmux)
+#   claude-agents --reset  Close the view and clear its state (sessions keep running)
+
+# Re-exec under bash 4.3+ on macOS if needed (namerefs require 4.3)
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
+  for _bash in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    [[ -x "$_bash" ]] && exec "$_bash" "$0" "$@"
+  done
+  echo "ERROR: bash 4.3+ required (found ${BASH_VERSION}). On macOS: brew install bash and add Homebrew's bin to your PATH before /bin"
+  exit 1
+fi
+
+VERSION="0.1.0-dev"
+_cs_realpath() {
+  local p="$1"
+  local dir
+  while [[ -L "$p" ]]; do
+    dir="$(cd "$(dirname "$p")" && pwd)"
+    p="$(readlink "$p")"
+    [[ "$p" != /* ]] && p="$dir/$p"
+  done
+  echo "$(cd "$(dirname "$p")" && pwd)/$(basename "$p")"
+}
+SCRIPT_PATH="$(_cs_realpath "$0")"
+cs_normalize_pwd() {
+  cd -P "${PWD}" || exit 1
+}
+cs_normalize_pwd
+# Agent view must be on for everything this tool runs, even when the shell that
+# started it had it off (claude-spaces sets it to 1 on the sessions it launches).
+export CLAUDE_CODE_DISABLE_AGENT_VIEW=0
+CLAUDE_DIR="${HOME}/.claude"
+PROJECTS_DIR="${CLAUDE_DIR}/projects"
+CS_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-agents"
+CS_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/claude-agents"
+CONFIG_FILE="${CS_CONFIG_DIR}/config"
+PROJECT_NAMES_FILE="${CS_DATA_DIR}/project_names"
+# seen/<id>: empty file whose mtime is when that session was last shown
+SEEN_DIR="${CS_DATA_DIR}/seen"
+# State root: under XDG_RUNTIME_DIR the parent is already per-user 0700. Under the
+# /tmp fallback, append -${UID} to prevent cross-user collisions on shared hosts.
+# This is the default only — the state_root config key overrides it.
+if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+  CS_STATE_ROOT="${XDG_RUNTIME_DIR}/claude-agents"
+else
+  CS_STATE_ROOT="/tmp/claude-agents-${UID}"
+fi
+
+# ── Compatibility ─────────────────────────────────
+# Bump for ANY change a running server cannot survive (tmux topology, state format).
+# The picker refuses to run against a server stamped with a different value and
+# restarts it instead of migrating. Stamped into ${STATE_DIR}/compat_version.
+CS_COMPAT_VERSION=1
+# The only Claude Code version this was verified against.
+CS_MIN_CLAUDE="2.1.325"
+# Stand-in command for a pane that must stay alive. `sleep infinity` is GNU-only.
+CS_SLEEP_CMD='exec sleep 2147483647'
+
+# ── Defaults ──────────────────────────────────────
+PICKER_WIDTH="30"
+RECENT_THRESHOLD=10
+PICKER_SIDE="right"
+WINDOW_NAME_LEN=12
+# Seconds between refreshes of the session list
+POLL_INTERVAL=2
+TERMINAL_HEIGHT="35%"
+TERMINAL_WIDTH="45%"
+MIN_CLAUDE_WIDTH=60
+MIN_CLAUDE_HEIGHT=10
+cs_server_name() {
+  local sum tail
+  sum=$(printf '%s' "$1" | cksum | cut -d' ' -f1)
+  tail="${1: -30}"
+  tail="${tail//\//-}"
+  printf 'ca-%s-%s' "$tail" "$sum"
+}
+TMUX_SERVER=$(cs_server_name "$PWD")
+TMUX_CONF="${HOME}/.tmux.conf"
+SHOW_INDEX=1
+CS_PREFIX=""
+declare -gA BIND_OVERRIDES=()
+declare -gA JUMP_SLOT=()
+declare -gA JUMP_TARGET=()
+# ── Color defaults (terminal-safe ANSI) ──────────
+CS_CLR_HEADER_BG='\e[7m'
+CS_CLR_ACTIVE='\e[1;32m'
+CS_CLR_BELL='\e[31m'
+CS_CLR_RUNNING=''
+CS_CLR_DORMANT='\e[2m'
+CS_CLR_SELECTION='\e[48;5;237m'
+CS_CLR_CHROME='\e[2m'
+CS_CLR_SECTION='\e[2;1m'
+CS_CLR_PROMPT_WARN='\e[33m'
+CS_CLR_PROMPT_DANGER='\e[31;1m'
+CS_CLR_BELL_MENU='\e[1;33m'
+CS_CLR_SEARCH_BAR='\e[30;42m'
+CS_CLR_BOLD='\e[1m'
+# Values from `claude agents --json` are checked against these before use
+ID_RE='^[0-9a-f]{8}$'
+UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+# Titles the picker gives the client pane. tmux keeps a pane's title across
+# respawn-pane and after its program exits, so every respawn sets one of these.
+CS_T_SWITCHING="claude-agents:switching"
+CS_T_WELCOME="claude-agents:welcome"
+CS_T_AGENTS="claude-agents:agents"
+
+# ── tmux wrapper ─────────────────────────────────
+_tmux() {
+  if [[ -n "${TMUX_SERVER}" ]]; then
+    command tmux -L "${TMUX_SERVER}" "$@"
+  else
+    command tmux "$@"
+  fi
+}
+
+# ── Config ────────────────────────────────────────
+# Config values get no shell expansion, so a literal ~ would be used verbatim.
+cs_expand_tilde() {
+  # SC2088: matching the literal tilde is the point.
+  # shellcheck disable=SC2088
+  if [[ "$1" == "~/"* ]]; then
+    printf '%s\n' "${HOME}/${1#\~/}"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+cs_load_config() {
+  mkdir -p "${CS_CONFIG_DIR}" "${CS_DATA_DIR}"
+  if [[ ! -f "${CONFIG_FILE}" ]]; then
+    cs_create_default_config
+  fi
+  while IFS='=' read -r key value; do
+    [[ -z "${key}" || "${key}" =~ ^[[:space:]]*# ]] && continue
+    key="${key// /}"
+    value="${value// /}"
+    # Validate numeric keys before assignment — values reach bash arithmetic,
+    # which recursively evaluates and would execute $(...) in malformed input.
+    case "${key}" in
+      recent_threshold|window_name_len|min_claude_width|min_claude_height|show_index|poll_interval)
+        if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+          echo "WARN: ignoring invalid ${key}=${value} (expected non-negative integer)" >&2
+          continue
+        fi
+        ;;
+      picker_width|terminal_height|terminal_width)
+        if [[ ! "${value}" =~ ^[0-9]+%?$ ]]; then
+          echo "WARN: ignoring invalid ${key}=${value} (expected integer or percentage)" >&2
+          continue
+        fi
+        ;;
+      tmux_conf)
+        # Expansion only — empty still means "don't source", and a bad path
+        # already degrades gracefully via the -f guard in cs_launch.
+        value=$(cs_expand_tilde "${value}")
+        ;;
+      state_root)
+        # A literal ~ would create a directory named '~' in $PWD.
+        value=$(cs_expand_tilde "${value}")
+        value="${value%/}"
+        # Relative paths would make the state root follow $PWD and break
+        # cross-project discovery. $HOME is refused because cs_init_state
+        # chmod 700s the root.
+        if [[ "${value}" != /* || "${value}" == "${HOME}" ]]; then
+          echo "WARN: ignoring invalid state_root=${value} (expected absolute path, not \$HOME)" >&2
+          continue
+        fi
+        ;;
+    esac
+    case "${key}" in
+      picker_width) PICKER_WIDTH="${value}" ;;
+      recent_threshold) RECENT_THRESHOLD="${value}" ;;
+      picker_side) PICKER_SIDE="${value}" ;;
+      window_name_len) WINDOW_NAME_LEN="${value}" ;;
+      tmux_conf) TMUX_CONF="${value}" ;;
+      poll_interval) POLL_INTERVAL="${value}" ;;
+      terminal_height) TERMINAL_HEIGHT="${value}" ;;
+      terminal_width) TERMINAL_WIDTH="${value}" ;;
+      min_claude_width) MIN_CLAUDE_WIDTH="${value}" ;;
+      min_claude_height) MIN_CLAUDE_HEIGHT="${value}" ;;
+      show_index) SHOW_INDEX="${value}" ;;
+      prefix) CS_PREFIX="${value}" ;;
+      state_root) CS_STATE_ROOT="${value}" ;;
+      color_header_bg) CS_CLR_HEADER_BG="${value}" ;;
+      color_active) CS_CLR_ACTIVE="${value}" ;;
+      color_bell) CS_CLR_BELL="${value}" ;;
+      color_running) CS_CLR_RUNNING="${value}" ;;
+      color_dormant) CS_CLR_DORMANT="${value}" ;;
+      color_selection) CS_CLR_SELECTION="${value}" ;;
+      color_chrome) CS_CLR_CHROME="${value}" ;;
+      color_section) CS_CLR_SECTION="${value}" ;;
+      color_prompt_warn) CS_CLR_PROMPT_WARN="${value}" ;;
+      color_prompt_danger) CS_CLR_PROMPT_DANGER="${value}" ;;
+      color_bell_menu) CS_CLR_BELL_MENU="${value}" ;;
+      color_search_bar) CS_CLR_SEARCH_BAR="${value}" ;;
+      color_bold) CS_CLR_BOLD="${value}" ;;
+      bind_*) BIND_OVERRIDES["${key}"]="${value}" ;;
+    esac
+  done < "${CONFIG_FILE}"
+}
+
+cs_create_default_config() {
+  cat > "${CONFIG_FILE}" << 'EOF'
+# claude-agents configuration
+# Uncomment and modify values to override defaults.
+
+# Picker pane width: characters (e.g. 30) or percentage (e.g. 20%)
+# picker_width=30
+
+# Sessions active within this many minutes sort at the top, by name; the rest
+# sort by most recent activity below them.
+# recent_threshold=10
+
+# Picker pane position: "right" (default) or "left"
+# picker_side=right
+
+# Max length for tmux window names
+# window_name_len=12
+
+# Path to tmux.conf to source on dedicated server (empty = don't source)
+# tmux_conf=~/.tmux.conf
+
+# Directory for runtime state. Defaults to $XDG_RUNTIME_DIR/claude-agents, or
+# /tmp/claude-agents-$UID when that is unset. Must be an absolute path (~/ is expanded).
+# state_root=~/.local/state/claude-agents
+
+# Seconds between refreshes of the session list. Each one runs `claude agents --json`.
+# poll_interval=2
+
+# Terminal pane height: characters (e.g. 15) or percentage (e.g. 35%).
+# A percentage shrinks with the window. A fixed height hides when a window
+# resize leaves it less than that next to min_claude_height; reopen it to
+# get what's left.
+# terminal_height=35%
+
+# Terminal pane width (side orientation): characters or percentage.
+# Resizes work the same way as terminal_height, against min_claude_width.
+# terminal_width=45%
+
+# Minimum Claude pane width when side terminal is open (characters)
+# min_claude_width=60
+
+# Minimum Claude pane height when bottom terminal is open (characters)
+# min_claude_height=10
+
+# Show jump index [1]-[0] next to the first 10 sessions
+# show_index=1
+
+# Override tmux prefix key (default: inherited from tmux.conf)
+# prefix=C-a
+
+# Keybinding overrides (comma-separated for multiple keys)
+# bind_terminal=`
+# bind_toggle_terminal=t
+# bind_side_terminal=Tab
+# bind_bottom_terminal=q
+# bind_focus_claude=Enter,i
+# bind_nav_next=J,S-Down
+# bind_nav_prev=K,S-Up
+# bind_pane_left=h,Left,S-Left
+# bind_pane_right=l,Right,S-Right
+# bind_pane_up=k,Up
+# bind_pane_down=j,Down
+# bind_focus_picker=Space
+# bind_detach=d
+# bind_zoom=z
+# bind_copy_mode=[
+# bind_paste=]
+# bind_search=/
+# bind_new_session=c
+# bind_close=x
+# bind_remove=D
+# bind_agents=v
+# bind_rename_project=p
+# bind_shutdown=s
+# bind_reload=R
+# bind_refresh=+
+# bind_menu=:
+
+# Color overrides (ANSI escape sequences, e.g. \e[1;32m)
+# color_header_bg=\e[7m
+# color_active=\e[1;32m
+# color_bell=\e[31m
+# color_running=
+# color_dormant=\e[2m
+# color_selection=\e[48;5;237m
+# color_chrome=\e[2m
+# color_section=\e[2;1m
+# color_prompt_warn=\e[33m
+# color_prompt_danger=\e[31;1m
+# color_bell_menu=\e[1;33m
+# color_search_bar=\e[30;42m
+# color_bold=\e[1m
+EOF
+}
+
+# ── Help Text ─────────────────────────────────────
+cs_help_text() {
+  echo "  Picker keys:"
+  echo "    j/k, Up/Down   Navigate sessions"
+  echo "    1-9, 0         Jump to Nth session + focus"
+  echo "    Enter          Show + focus session"
+  echo "    Space          Show session (stay in picker)"
+  echo "    a/i            Focus Claude pane"
+  echo "    h/l            Move between panes"
+  echo "    /              Search sessions"
+  echo "    :              Command menu"
+  echo "    ?              Help      Q  Detach    R  Reload"
+  echo "  Prefix keys (from any pane):"
+  echo "    hjkl, Arrows   Pane movement"
+  echo "    J/K, S-Arrows  Next/prev session + focus"
+  echo "    Space          Picker/Claude toggle"
+  echo "    Enter/i        Focus Claude pane"
+  echo "    \`              Terminal: open / switch focus"
+  echo "    Tab            Terminal: move to side"
+  echo "    q              Terminal: move to bottom"
+  echo "    t              Toggle terminal on/off"
+  echo "    a              Literal grave (\`)"
+  echo "    c  New   x  Stop   D  Remove"
+  echo "    v              Agent view (/resume there for older ones)"
+  echo "    s  Shutdown    R  Reload picker   +  Refresh"
+  echo "    z              Zoom pane"
+  echo "    :              Command menu"
+  echo "    ?  Help   d  Detach"
+  echo "    [/]            Copy/paste"
+  echo ""
+  echo "  In a session, the left arrow on an empty prompt opens agent view."
+}
+
+# ── Preflight ─────────────────────────────────────
+cs_preflight() {
+  local ok=1
+  command -v tmux &>/dev/null || { echo "ERROR: tmux not found. Please install using your package manager."; ok=0; }
+  command -v jq &>/dev/null || { echo "ERROR: jq not found. Please install using your package manager."; ok=0; }
+  command -v claude &>/dev/null || { echo "ERROR: claude not found. Install from https://docs.anthropic.com/en/docs/claude-code"; ok=0; }
+  ((ok)) || exit 1
+}
+
+# Every claude call goes through here. It gets no stdin, so nothing can turn
+# interactive inside the picker: with a terminal, `claude --bg` shows a trust dialog.
+cs_claude() {
+  claude "$@" < /dev/null
+}
+
+# True when dotted version $1 is at least $2.
+cs_version_ge() {
+  local -a a b
+  IFS=. read -ra a <<< "$1"
+  IFS=. read -ra b <<< "$2"
+  local i x y
+  for i in 0 1 2; do
+    x="${a[i]:-0}"
+    y="${b[i]:-0}"
+    [[ "${x}" =~ ^[0-9]+$ && "${y}" =~ ^[0-9]+$ ]] || return 1
+    ((x > y)) && return 0
+    ((x < y)) && return 1
+  done
+  return 0
+}
+
+# Run before a server is created: a Claude that cannot list background sessions
+# would leave the picker with nothing but an error.
+cs_preflight_claude() {
+  local ver out
+  ver=$(cs_claude --version 2>/dev/null) || ver=""
+  ver="${ver%% *}"
+  if ! cs_version_ge "${ver}" "${CS_MIN_CLAUDE}"; then
+    echo "ERROR: claude-agents needs Claude Code ${CS_MIN_CLAUDE} or newer (found '${ver:-unknown}')."
+    return 1
+  fi
+  if ! out=$(cs_claude agents --json 2>&1 >/dev/null); then
+    echo "ERROR: 'claude agents --json' failed:"
+    echo "  ${out%%$'\n'*}"
+    return 1
+  fi
+}
+
+# ── Portability ───────────────────────────────────
+if stat -c '%Y' / &>/dev/null; then
+  _cs_stat() { stat -c '%Y %n' "$@"; }
+else
+  _cs_stat() { stat -f '%m %N' "$@"; }
+fi
+
+# ── State ─────────────────────────────────────────
+cs_sanitize_path() {
+  local p="${1//\//-}"
+  echo "${p//_/-}"
+}
+PWD_SANITIZED=$(cs_sanitize_path "${PWD}")
+
+# Refuse to operate on a malformed STATE_DIR. Used before any rm -rf.
+cs_assert_state_dir_safe() {
+  if [[ -z "${PWD_SANITIZED}" \
+        || "${STATE_DIR}" == "${CS_STATE_ROOT}" \
+        || "${STATE_DIR}" == "${CS_STATE_ROOT}/" \
+        || "${PWD_SANITIZED}" == "/" \
+        || "${PWD_SANITIZED}" == "." ]]; then
+    echo "ERROR: refusing to operate on malformed STATE_DIR='${STATE_DIR}'" >&2
+    exit 1
+  fi
+}
+
+cs_init_state() {
+  # Guard CS_STATE_ROOT against pre-existing symlink/wrong-owner attacks.
+  [[ -L "${CS_STATE_ROOT}" ]] && { echo "ERROR: ${CS_STATE_ROOT} is a symlink — aborting" >&2; exit 1; }
+  [[ -e "${CS_STATE_ROOT}" && ! -O "${CS_STATE_ROOT}" ]] && { echo "ERROR: ${CS_STATE_ROOT} not owned by current user" >&2; exit 1; }
+  # SC2174: -m only applies to the deepest component. A custom state_root may
+  # need intermediate dirs, whose mode is left to umask; the leaf mode is
+  # enforced by the chmod below.
+  # shellcheck disable=SC2174
+  mkdir -m 700 -p "${CS_STATE_ROOT}" || { echo "ERROR: cannot create state root ${CS_STATE_ROOT} (check state_root in ${CONFIG_FILE})" >&2; exit 1; }
+  chmod 700 "${CS_STATE_ROOT}" || { echo "ERROR: chmod 700 ${CS_STATE_ROOT} failed" >&2; exit 1; }
+  [[ -L "${CS_STATE_ROOT}" || ! -O "${CS_STATE_ROOT}" ]] && { echo "ERROR: ${CS_STATE_ROOT} swapped after mkdir" >&2; exit 1; }
+
+  PWD_SANITIZED=$(cs_sanitize_path "${PWD}")
+  local sanitized="${PWD_SANITIZED}"
+  STATE_DIR="${CS_STATE_ROOT}/${sanitized}"
+  cs_assert_state_dir_safe
+  # If picker pane from previous run is dead, wipe stale state
+  cs_refresh_pane_cache
+  local old_picker
+  old_picker=$(cs_read_state picker_pane)
+  if [[ -n "${old_picker}" ]] && ! cs_pane_alive "${old_picker}"; then
+    rm -rf "${STATE_DIR}"
+  fi
+  mkdir -p "${STATE_DIR}"
+  echo "${PWD}" > "${STATE_DIR}/project_path"
+  # Stamp compat_version exactly when there is no live picker — i.e. we are the ones about to
+  # build this server's topology. Keying this on "is the dir fresh" instead would never
+  # stamp a dir that exists without a picker_pane (picker_pane is written by the picker
+  # itself, later), and the gate would then kill every server it starts: a boot loop.
+  # A LIVE picker means some other version built this server — leave it unstamped so
+  # the gate can see the mismatch.
+  if [[ -z "${old_picker}" ]] || ! cs_pane_alive "${old_picker}"; then
+    echo "${CS_COMPAT_VERSION}" > "${STATE_DIR}/compat_version"
+  fi
+}
+
+cs_read_state_into() {
+  local _v=""
+  { _v=$(< "${STATE_DIR}/$2"); } 2>/dev/null
+  printf -v "$1" '%s' "${_v}"
+}
+cs_read_state() { local _rs; cs_read_state_into _rs "$1"; printf '%s' "${_rs}"; }
+
+cs_rename_pane_window() {
+  local pane="$1" name="$2"
+  if ((${#name} > WINDOW_NAME_LEN)); then
+    name="${name:0:${WINDOW_NAME_LEN}}"
+  fi
+  _tmux rename-window -t "${pane}" "${name}" 2>/dev/null || true
+  _tmux set-option -t "${pane}" -w automatic-rename off 2>/dev/null || true
+}
+
+LIVE_PANES=""
+PICKER_ACTIVE=""
+CLIENT_PANE=""
+CLIENT_TITLE=""
+SESSION_ATTACHED=1
+# One tmux call per scan: live panes, every pane's title, picker focus and the
+# number of attached clients. Titles come from list-panes, not display-message,
+# which silently answers for the active pane when its target is gone.
+cs_refresh_pane_cache() {
+  PICKER_ACTIVE=""
+  CLIENT_TITLE=""
+  if [[ -z "${PICKER_PANE:-}" ]]; then
+    LIVE_PANES=$(_tmux list-panes -a -F '#{pane_id}' 2>/dev/null || true)
+    return 0
+  fi
+  local _o _last _rest
+  _o=$(_tmux list-panes -a -F '#{pane_id}' \; \
+             list-panes -a -F 'T#{pane_id} #{pane_title}' \; \
+             display-message -t "${PICKER_PANE}" -p 'F#{pane_active} #{session_attached}' 2>/dev/null || true)
+  _last="${_o##*$'\n'}"
+  if [[ "${_last}" == F* ]]; then
+    _last="${_last#F}"
+    PICKER_ACTIVE="${_last%% *}"
+    [[ "${_last##* }" =~ ^[0-9]+$ ]] && SESSION_ATTACHED="${_last##* }"
+    _o="${_o%$'\n'*}"
+  fi
+  if [[ -n "${CLIENT_PANE}" ]]; then
+    _rest="${_o#*$'\n'"T${CLIENT_PANE} "}"
+    [[ "${_rest}" != "${_o}" ]] && CLIENT_TITLE="${_rest%%$'\n'*}"
+  fi
+  LIVE_PANES="${_o%%$'\n'T%*}"
+}
+cs_pane_alive() {
+  [[ $'\n'"${LIVE_PANES}"$'\n' == *$'\n'"$1"$'\n'* ]]
+}
+
+# ── Entry Helpers ─────────────────────────────────
+# Parallel arrays, one row each: ID is the job id, SID the session UUID, MTIME the
+# last activity (epoch), STATUS the state from Claude, PATH the session's cwd.
+cs_entry_append() {
+  if [[ -n "${CS_TESTING:-}" ]] && (($# != 7)); then
+    echo "FATAL: cs_entry_append called with $# args, expected 7" >&2; exit 1
+  fi
+  ENTRIES_ID+=("$1"); ENTRIES_NAME+=("$2"); ENTRIES_MTIME+=("$3")
+  ENTRIES_STATUS+=("$4"); ENTRIES_SID+=("$5"); ENTRIES_TYPE+=("$6"); ENTRIES_PATH+=("$7")
+}
+
+cs_entry_prepend() {
+  if [[ -n "${CS_TESTING:-}" ]] && (($# != 7)); then
+    echo "FATAL: cs_entry_prepend called with $# args, expected 7" >&2; exit 1
+  fi
+  ENTRIES_ID=("$1" "${ENTRIES_ID[@]}"); ENTRIES_NAME=("$2" "${ENTRIES_NAME[@]}")
+  ENTRIES_MTIME=("$3" "${ENTRIES_MTIME[@]}"); ENTRIES_STATUS=("$4" "${ENTRIES_STATUS[@]}")
+  ENTRIES_SID=("$5" "${ENTRIES_SID[@]}"); ENTRIES_TYPE=("$6" "${ENTRIES_TYPE[@]}")
+  ENTRIES_PATH=("$7" "${ENTRIES_PATH[@]}")
+}
+
+cs_entry_clear() {
+  ENTRIES_ID=(); ENTRIES_NAME=(); ENTRIES_MTIME=(); ENTRIES_STATUS=()
+  ENTRIES_SID=(); ENTRIES_TYPE=(); ENTRIES_PATH=()
+}
+
+declare -gA PROJECT_NAMES
+declare -gA SORT_MEMO_IN SORT_MEMO_OUT
+# The last list Claude gave us, keyed by job id
+AG_IDS=()
+declare -gA AG_STATE AG_STATUS AG_SID AG_CWD AG_NAME AG_STARTED
+# Transcript bookkeeping, keyed by job id: path, mtime at the last read, last
+# activity (epoch) and where that came from ("record" or "mtime")
+declare -gA AG_TPATH AG_TMTIME AG_ACT AG_ACT_SRC
+# seen/<id> mtimes, sessions flagged as finished and unseen, and how many
+# successful polls in a row a seen file's session has been missing
+declare -gA SEEN_AT UNSEEN_SET SEEN_ABSENT
+POLL_ERROR=""
+POLLED=0
+LAST_POLL=0
+# One-line result of the last command, shown in the footer until the next key
+FOOTER_MSG=""
+# displayed: the session the picker put in the client pane (state file `displayed`).
+# shown: what the client pane shows right now, read from its title on every scan.
+DISPLAYED=""
+SHOWN=""
+WINDOW_FOCUSED=1
+RECENT_CUTOFF=0
+
+cs_load_project_names() {
+  PROJECT_NAMES=()
+  if [[ -f "${PROJECT_NAMES_FILE}" ]]; then
+    local nkey nval
+    while IFS='=' read -r nkey nval; do
+      [[ -z "${nkey}" || "${nkey}" =~ ^[[:space:]]*# ]] && continue
+      PROJECT_NAMES["${nkey}"]="${nval}"
+    done < "${PROJECT_NAMES_FILE}"
+  fi
+}
+
+# ── Display Name Disambiguation ──────────────────
+declare -gA DISPLAY_NAMES
+# The other projects that have sessions, as "x|<path>": the shape the name code
+# was written for. INACTIVE_PROJECTS stays empty; there is no such section here.
+REMOTE_SERVERS=()
+INACTIVE_PROJECTS=()
+
+cs_compress_suffix() {
+  local suffix="$1"
+  local stripped="${suffix//[!\/]/}"
+  local slashes=${#stripped}
+  if ((slashes <= 1)); then
+    echo "${suffix}"
+  else
+    echo "${suffix%%/*}/.../${suffix##*/}"
+  fi
+}
+
+cs_resolve_collision_group() {
+  local -n _grp=$1
+  local n=${#_grp[@]}
+  local -a comp_strs=()
+  local gi
+  for ((gi=0; gi<n; gi++)); do
+    local -a _parts
+    IFS='/' read -ra _parts <<< "${_grp[gi]}"
+    local -a _filtered=()
+    local _c
+    for _c in "${_parts[@]}"; do
+      [[ -n "${_c}" ]] && _filtered+=("${_c}")
+    done
+    local IFS=$'\n'
+    comp_strs+=("${_filtered[*]}")
+  done
+  local depth=1
+  while true; do
+    local -A suffix_map
+    suffix_map=()
+    local -a suffixes=()
+    for ((gi=0; gi<n; gi++)); do
+      local -a comps
+      mapfile -t comps <<< "${comp_strs[gi]}"
+      local nc=${#comps[@]}
+      local suffix=""
+      local di start=$((nc - depth))
+      ((start < 0)) && start=0
+      for ((di=start; di<nc; di++)); do
+        [[ -n "${suffix}" ]] && suffix+="/"
+        suffix+="${comps[di]}"
+      done
+      suffixes+=("${suffix}")
+      suffix_map["${suffix}"]=$(( ${suffix_map["${suffix}"]:-0} + 1 ))
+    done
+    local all_unique=1
+    for ((gi=0; gi<n; gi++)); do
+      ((suffix_map["${suffixes[gi]}"] > 1)) && { all_unique=0; break; }
+    done
+    if ((all_unique)); then
+      # Compress, then check for display collisions
+      local -a compressed=()
+      local -A comp_count
+      comp_count=()
+      for ((gi=0; gi<n; gi++)); do
+        local _cs
+        _cs=$(cs_compress_suffix "${suffixes[gi]}")
+        compressed+=("${_cs}")
+        comp_count["${_cs}"]=$(( ${comp_count["${_cs}"]:-0} + 1 ))
+      done
+      for ((gi=0; gi<n; gi++)); do
+        if ((comp_count["${compressed[gi]}"] > 1)); then
+          DISPLAY_NAMES["${_grp[gi]}"]="${suffixes[gi]}"
+        else
+          DISPLAY_NAMES["${_grp[gi]}"]="${compressed[gi]}"
+        fi
+      done
+      return
+    fi
+    ((depth++))
+    if ((depth > 50)); then
+      for ((gi=0; gi<n; gi++)); do
+        DISPLAY_NAMES["${_grp[gi]}"]="${_grp[gi]}"
+      done
+      return
+    fi
+  done
+}
+
+cs_compute_display_names() {
+  DISPLAY_NAMES=()
+  local -a all_paths=()
+  local -A seen
+  local _p
+  for _p in "${PWD}" \
+        "${REMOTE_SERVERS[@]/#*|/}" \
+        "${INACTIVE_PROJECTS[@]/#*|/}"; do
+    [[ -z "${_p}" || -v "seen[${_p}]" ]] && continue
+    seen["${_p}"]=1
+    all_paths+=("${_p}")
+  done
+  local -A leaf_count
+  for _p in "${all_paths[@]}"; do
+    local _leaf="${_p##*/}"
+    leaf_count["${_leaf}"]=$(( ${leaf_count["${_leaf}"]:-0} + 1 ))
+  done
+  local -A leaf_done
+  for _p in "${all_paths[@]}"; do
+    local _leaf="${_p##*/}"
+    if ((leaf_count["${_leaf}"] == 1)); then
+      DISPLAY_NAMES["${_p}"]="${_leaf}"
+    elif [[ ! -v "leaf_done[${_leaf}]" ]]; then
+      leaf_done["${_leaf}"]=1
+      local -a group=()
+      local _q
+      for _q in "${all_paths[@]}"; do
+        [[ "${_q##*/}" == "${_leaf}" ]] && group+=("${_q}")
+      done
+      cs_resolve_collision_group group
+    fi
+  done
+}
+
+# ── Polling ───────────────────────────────────────
+# Refresh the session list: from Claude, or from the shared cache when another
+# picker refreshed it within the interval. $1=1 bypasses the cache. Returns 1
+# when Claude fails; the previous list then stays in place.
+cs_agents_refresh() {
+  local force="${1:-0}"
+  local cache="${CS_STATE_ROOT}/agents.json"
+  local now json="" from_cache=0
+  printf -v now '%(%s)T' -1
+  LAST_POLL=${now}
+  if ((!force)) && [[ -f "${cache}" ]]; then
+    local cm
+    cm=$(_cs_stat "${cache}" 2>/dev/null) || cm=""
+    cm="${cm%% *}"
+    if [[ "${cm}" =~ ^[0-9]+$ ]] && ((now - cm < POLL_INTERVAL)); then
+      { json=$(< "${cache}"); } 2>/dev/null
+      [[ -n "${json}" ]] && from_cache=1
+    fi
+  fi
+  if ((!from_cache)); then
+    if ! json=$(cs_claude agents --json --all 2>"${STATE_DIR}/poll.err"); then
+      { POLL_ERROR=$(< "${STATE_DIR}/poll.err"); } 2>/dev/null
+      POLL_ERROR="${POLL_ERROR%%$'\n'*}"
+      [[ -n "${POLL_ERROR}" ]] || POLL_ERROR="claude agents --json failed"
+      return 1
+    fi
+  fi
+  # One row per background session. Control characters are taken out of the name
+  # here, which also guarantees one session per line.
+  local rows
+  if ! rows=$(jq -r '.[] | select(.kind == "background")
+        | [.id, (.state // ""), (.status // ""), (.sessionId // ""), (.cwd // ""),
+           ((.startedAt // 0) | tostring), ((.name // "") | gsub("[[:cntrl:]]"; " "))]
+        | join("\u001f")' <<< "${json}" 2>/dev/null); then
+    POLL_ERROR="could not read the session list from claude"
+    return 1
+  fi
+  if ((!from_cache)); then
+    # temp file + mv: another picker reading the cache never sees half of it
+    printf '%s\n' "${json}" > "${cache}.$$" 2>/dev/null && mv "${cache}.$$" "${cache}" 2>/dev/null
+  fi
+  POLL_ERROR=""
+  POLLED=1
+  AG_IDS=()
+  AG_STATE=(); AG_STATUS=(); AG_SID=(); AG_CWD=(); AG_NAME=(); AG_STARTED=()
+  local id state status sid cwd started name
+  while IFS=$'\x1f' read -r id state status sid cwd started name; do
+    # These end up in command lines: nothing but the expected shapes gets through.
+    [[ "${id}" =~ ${ID_RE} ]] || continue
+    [[ "${sid}" =~ ${UUID_RE} ]] || sid=""
+    [[ "${started}" =~ ^[0-9]+$ ]] || started=0
+    AG_IDS+=("${id}")
+    AG_STATE["${id}"]="${state}"
+    AG_STATUS["${id}"]="${status}"
+    AG_SID["${id}"]="${sid}"
+    AG_CWD["${id}"]="${cwd}"
+    AG_STARTED["${id}"]="${started}"
+    AG_NAME["${id}"]="${name}"
+  done <<< "${rows}"
+  return 0
+}
+
+# Epoch of the last conversation record in the final $2 bytes of transcript $1:
+# a user or assistant message, or the end of a turn. Housekeeping records carry
+# no timestamp or are not activity. A line cut in half by the window is skipped.
+cs_transcript_last_activity() {
+  tail -c "$2" "$1" 2>/dev/null | jq -rRn '
+    [inputs | fromjson?
+      | select(.type == "user" or .type == "assistant"
+               or (.type == "system" and .subtype == "turn_duration"))
+      | .timestamp | select(type == "string")]
+    | last // empty | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601' 2>/dev/null
+}
+
+# Find each session's transcript and read its last activity. The file is found by
+# session id, not by a computed directory name, and is read again only when its
+# mtime changed. The mtime itself is not the activity time: Claude appends
+# housekeeping records when a process stops, restarts or is attached.
+cs_activity_refresh() {
+  local id sid path cand
+  local -a paths=()
+  for id in "${AG_IDS[@]}"; do
+    sid="${AG_SID[${id}]}"
+    [[ -n "${sid}" ]] || continue
+    path="${AG_TPATH[${id}]:-}"
+    if [[ -z "${path}" || ! -f "${path}" ]]; then
+      path=""
+      for cand in "${PROJECTS_DIR}"/*/"${sid}.jsonl"; do
+        if [[ -f "${cand}" ]]; then
+          path="${cand}"
+          break
+        fi
+      done
+      AG_TPATH["${id}"]="${path}"
+    fi
+    [[ -n "${path}" ]] && paths+=("${path}")
+  done
+  ((${#paths[@]} > 0)) || return 0
+  local -A mt=()
+  local m f ts
+  while read -r m f; do
+    mt["${f}"]="${m}"
+  done < <(_cs_stat "${paths[@]}" 2>/dev/null)
+  for id in "${AG_IDS[@]}"; do
+    path="${AG_TPATH[${id}]:-}"
+    [[ -n "${path}" ]] || continue
+    m="${mt[${path}]:-}"
+    [[ -n "${m}" ]] || continue
+    [[ "${AG_TMTIME[${id}]:-}" == "${m}" ]] && continue
+    AG_TMTIME["${id}"]="${m}"
+    ts=$(cs_transcript_last_activity "${path}" 262144)
+    [[ -n "${ts}" ]] || ts=$(cs_transcript_last_activity "${path}" 4194304)
+    if [[ "${ts}" =~ ^[0-9]+$ ]]; then
+      AG_ACT["${id}"]="${ts}"
+      AG_ACT_SRC["${id}"]="record"
+    else
+      # good enough for the age column and the order, never for a bell
+      AG_ACT["${id}"]="${m}"
+      AG_ACT_SRC["${id}"]="mtime"
+    fi
+  done
+}
+
+# Read when each session was last shown, and sweep the files of sessions that
+# are gone. Called only after a successful poll: a failed one proves nothing.
+cs_seen_refresh() {
+  SEEN_AT=()
+  [[ -d "${SEEN_DIR}" ]] || return 0
+  local m f id
+  while read -r m f; do
+    id="${f##*/}"
+    [[ "${id}" =~ ${ID_RE} ]] || continue
+    SEEN_AT["${id}"]="${m}"
+  done < <(_cs_stat "${SEEN_DIR}"/* 2>/dev/null)
+  for id in "${!SEEN_AT[@]}"; do
+    if [[ -v "AG_STATE[${id}]" ]]; then
+      unset "SEEN_ABSENT[${id}]"
+      continue
+    fi
+    SEEN_ABSENT["${id}"]=$(( ${SEEN_ABSENT[${id}]:-0} + 1 ))
+    if ((SEEN_ABSENT[${id}] >= 5)); then
+      rm -f "${SEEN_DIR}/${id}"
+      unset "SEEN_ABSENT[${id}]" "SEEN_AT[${id}]"
+    fi
+  done
+}
+
+# Record that session $1 is being looked at. The redirect updates the file's
+# mtime without forking, and the file is never rewritten with content, so two
+# pickers cannot lose each other's update.
+cs_mark_seen() {
+  local id="$1"
+  [[ "${id}" =~ ${ID_RE} ]] || return 0
+  { : > "${SEEN_DIR}/${id}"; } 2>/dev/null || return 0
+  printf -v "SEEN_AT[${id}]" '%(%s)T' -1
+  unset "UNSEEN_SET[${id}]"
+}
+
+# Finished, unseen: done or failed, and active since it was last shown. A session
+# never shown here has nothing to compare against and is not flagged. Only a time
+# read from a transcript record counts; an mtime moves on housekeeping and would
+# raise a bell an hour after every conversation.
+cs_compute_unseen() {
+  UNSEEN_SET=()
+  local id st
+  for id in "${AG_IDS[@]}"; do
+    st="${AG_STATE[${id}]}"
+    [[ "${st}" == "done" || "${st}" == "failed" ]] || continue
+    [[ -v "SEEN_AT[${id}]" ]] || continue
+    if [[ "${AG_ACT_SRC[${id}]:-}" == "record" ]] && ((AG_ACT[${id}] > SEEN_AT[${id}])); then
+      UNSEEN_SET["${id}"]=1
+    fi
+  done
+}
+
+# Refresh the list and everything derived from it. $1=1 bypasses the cache.
+cs_poll() {
+  cs_agents_refresh "${1:-0}" || return 1
+  cs_activity_refresh
+  cs_seen_refresh
+  cs_term_sweep
+}
+
+# Poll when the interval is up, and only while someone is attached to look.
+cs_poll_tick() {
+  ((SESSION_ATTACHED > 0)) || return 0
+  local now
+  printf -v now '%(%s)T' -1
+  ((now - LAST_POLL >= POLL_INTERVAL)) || return 0
+  cs_poll || true
+}
+
+# ── Session List ──────────────────────────────────
+# Sort newline-joined lines $3 with sort args $4..., into var $1. Memoized under key $2.
+cs_sort_memo() {
+  local _out="$1" _key="$2" _in="$3"
+  shift 3
+  if [[ -n "${SORT_MEMO_IN[${_key}]+x}" && "${SORT_MEMO_IN[${_key}]}" == "${_in}" ]]; then
+    printf -v "${_out}" '%s' "${SORT_MEMO_OUT[${_key}]}"
+    return
+  fi
+  local _so
+  _so=$(sort "$@" <<< "${_in}")
+  SORT_MEMO_IN["${_key}"]="${_in}"
+  SORT_MEMO_OUT["${_key}"]="${_so}"
+  printf -v "${_out}" '%s' "${_so}"
+}
+
+# Sessions active within recent_threshold minutes first, by name; then the rest,
+# most recent first. Ended sessions (failed, stopped) always sort with the rest.
+cs_sort_entries() {
+  local n=${#ENTRIES_ID[@]}
+  local now
+  printf -v now '%(%s)T' -1
+  RECENT_CUTOFF=$((now - RECENT_THRESHOLD * 60))
+  ((n <= 1)) && return 0
+
+  local recent_indices=() older_indices=() i
+  for ((i = 0; i < n; i++)); do
+    case "${ENTRIES_STATUS[i]}" in
+      failed|stopped)
+        older_indices+=("${i}")
+        ;;
+      *)
+        if ((ENTRIES_MTIME[i] >= RECENT_CUTOFF)); then
+          recent_indices+=("${i}")
+        else
+          older_indices+=("${i}")
+        fi
+        ;;
+    esac
+  done
+
+  # Sort recent by name (case-insensitive); index first to handle spaces
+  local sorted_recent=""
+  if ((${#recent_indices[@]} > 0)); then
+    local _rin=""
+    for i in "${recent_indices[@]}"; do
+      _rin+="${_rin:+$'\n'}${i} ${ENTRIES_NAME[${i}],,}"
+    done
+    cs_sort_memo sorted_recent recent "${_rin}" -t' ' -k2
+  fi
+
+  # Sort older by last activity, descending
+  local sorted_older=""
+  if ((${#older_indices[@]} > 0)); then
+    local _oin=""
+    for i in "${older_indices[@]}"; do
+      _oin+="${_oin:+$'\n'}${ENTRIES_MTIME[${i}]} ${i}"
+    done
+    cs_sort_memo sorted_older older "${_oin}" -rnk1
+  fi
+
+  local new_id=() new_name=() new_mtime=() new_status=() new_sid=() new_type=() new_path=()
+  local idx
+  if [[ -n "${sorted_recent}" ]]; then
+    while read -r idx _; do
+      new_id+=("${ENTRIES_ID[${idx}]}")
+      new_name+=("${ENTRIES_NAME[${idx}]}")
+      new_mtime+=("${ENTRIES_MTIME[${idx}]}")
+      new_status+=("${ENTRIES_STATUS[${idx}]}")
+      new_sid+=("${ENTRIES_SID[${idx}]}")
+      new_type+=("${ENTRIES_TYPE[${idx}]}")
+      new_path+=("${ENTRIES_PATH[${idx}]}")
+    done <<< "${sorted_recent}"
+  fi
+  if [[ -n "${sorted_older}" ]]; then
+    while read -r _ idx; do
+      new_id+=("${ENTRIES_ID[${idx}]}")
+      new_name+=("${ENTRIES_NAME[${idx}]}")
+      new_mtime+=("${ENTRIES_MTIME[${idx}]}")
+      new_status+=("${ENTRIES_STATUS[${idx}]}")
+      new_sid+=("${ENTRIES_SID[${idx}]}")
+      new_type+=("${ENTRIES_TYPE[${idx}]}")
+      new_path+=("${ENTRIES_PATH[${idx}]}")
+    done <<< "${sorted_older}"
+  fi
+
+  ENTRIES_ID=("${new_id[@]}")
+  ENTRIES_NAME=("${new_name[@]}")
+  ENTRIES_MTIME=("${new_mtime[@]}")
+  ENTRIES_STATUS=("${new_status[@]}")
+  ENTRIES_SID=("${new_sid[@]}")
+  ENTRIES_TYPE=("${new_type[@]}")
+  ENTRIES_PATH=("${new_path[@]}")
+}
+
+# Build the rows from the last list: this project's background sessions, then
+# the other projects that have any. A session inside <project>/.claude/worktrees/
+# belongs to <project>.
+cs_build_all_entries() {
+  cs_entry_clear
+  local id name mt proj
+  # other project → its session ids, space separated
+  local -A other=()
+  for id in "${AG_IDS[@]}"; do
+    proj="${AG_CWD[${id}]%%/.claude/worktrees/*}"
+    if [[ "${proj}" != "${PWD}" ]]; then
+      [[ -n "${proj}" ]] && other["${proj}"]+="${id} "
+      continue
+    fi
+    cs_row_fields name mt "${id}"
+    cs_entry_append "${id}" "${name}" "${mt}" "${AG_STATE[${id}]}" "${AG_SID[${id}]}" "local" "${AG_CWD[${id}]}"
+  done
+  cs_sort_entries
+
+  # Other projects: each one that has background sessions, then its sessions, most
+  # recent first. Selecting either hops to that project's own view.
+  local projs="" sorted=""
+  for proj in "${!other[@]}"; do
+    projs+="${projs:+$'\n'}${proj}"
+  done
+  [[ -n "${projs}" ]] && cs_sort_memo sorted projects "${projs}"
+  cs_other_projects_names "${sorted}"
+  [[ -n "${sorted}" ]] || return 0
+
+  cs_entry_append "__spacer_remote__" "" "0" "" "" "spacer" ""
+  cs_entry_append "__hdr_remote__" "other projects" "0" "" "" "header" ""
+  local first=1 sanitized leaf lines order
+  while IFS= read -r proj; do
+    [[ -n "${proj}" ]] || continue
+    sanitized="${proj//\//-}"
+    sanitized="${sanitized//_/-}"
+    leaf="${PROJECT_NAMES[${sanitized}]:-${DISPLAY_NAMES[${proj}]:-${proj##*/}}}"
+    if ((first)); then
+      first=0
+    else
+      cs_entry_append "__spacer_proj_${sanitized}__" "" "0" "" "" "spacer" ""
+    fi
+    cs_entry_append "__proj_${sanitized}__" "${leaf}" "0" "" "" "project" "${proj}"
+    lines=""
+    for id in ${other[${proj}]}; do
+      cs_row_fields name mt "${id}"
+      lines+="${lines:+$'\n'}${mt} ${id}"
+    done
+    cs_sort_memo order "remote:${proj}" "${lines}" -rnk1
+    while read -r _ id; do
+      [[ -n "${id}" ]] || continue
+      cs_row_fields name mt "${id}"
+      cs_entry_append "${id}" "${name}" "${mt}" "${AG_STATE[${id}]}" "${AG_SID[${id}]}" "remote" "${proj}"
+    done <<< "${order}"
+  done <<< "${sorted}"
+}
+
+# Name and last-activity time of session $3's row, into the variables named $1
+# and $2.
+cs_row_fields() {
+  local _rf_n="$1" _rf_m="$2" _rf_id="$3"
+  local _rf_st="${AG_STATE[${_rf_id}]}" _rf_name="${AG_NAME[${_rf_id}]}" _rf_mt
+  if [[ -z "${_rf_name}" || "${_rf_name}" == "${_rf_id}" ]]; then
+    # no prompt yet: Claude names it after its own id
+    if [[ "${_rf_st}" == "blocked" && "${AG_STATUS[${_rf_id}]}" == "idle" ]]; then
+      _rf_name="(new session)"
+    else
+      _rf_name="${_rf_id}"
+    fi
+  fi
+  case "${_rf_st}" in
+    failed|stopped) _rf_name+=" (${_rf_st})" ;;
+  esac
+  # no transcript yet: order by when it started, and show no age
+  if [[ -n "${AG_ACT[${_rf_id}]:-}" ]]; then
+    _rf_mt="${AG_ACT[${_rf_id}]}"
+  else
+    _rf_mt=$(( AG_STARTED[${_rf_id}] / 1000 ))
+  fi
+  printf -v "${_rf_n}" '%s' "${_rf_name}"
+  printf -v "${_rf_m}" '%s' "${_rf_mt}"
+}
+
+# Display names depend on which projects are listed. Recompute them only when
+# that set changes. $1 is the sorted list of other projects, one per line.
+OTHER_PROJECTS_KEY=""
+cs_other_projects_names() {
+  [[ "$1" == "${OTHER_PROJECTS_KEY}" ]] && return 0
+  OTHER_PROJECTS_KEY="$1"
+  REMOTE_SERVERS=()
+  local p
+  while IFS= read -r p; do
+    [[ -n "${p}" ]] && REMOTE_SERVERS+=("x|${p}")
+  done <<< "$1"
+  cs_compute_display_names
+}
+
+# Rebuild the rows from what the last poll left, keeping the cursor on its session.
+cs_rescan() {
+  local selected_id=""
+  if ((${#ENTRIES_ID[@]} > 0 && SELECTED < ${#ENTRIES_ID[@]})); then
+    selected_id="${ENTRIES_ID[${SELECTED}]}"
+  fi
+  cs_compute_unseen
+  cs_build_all_entries
+  cs_search_save_full
+  # Restore selection: by ID, then the shown session, then clamp
+  local _sel_found=0 idx
+  if [[ -n "${selected_id}" ]]; then
+    cs_find_entry_index "${selected_id}" idx
+    if [[ "${idx}" != "-1" ]]; then
+      SELECTED=${idx}
+      _sel_found=1
+    fi
+  fi
+  if ((!_sel_found)); then
+    if [[ -n "${SHOWN}" ]]; then
+      cs_find_entry_index "${SHOWN}" idx
+      if [[ "${idx}" != "-1" ]]; then
+        SELECTED=${idx}
+      fi
+    fi
+    local n=${#ENTRIES_ID[@]}
+    if ((SELECTED >= n && n > 0)); then
+      SELECTED=$((n - 1))
+    fi
+  fi
+  if ((SEARCH_ACTIVE)); then
+    cs_search_apply_filter
+  fi
+}
+
+cs_find_entry_index() {
+  local target_id="$1" _out="$2"
+  for ((fi=0; fi < ${#ENTRIES_ID[@]}; fi++)); do
+    if [[ "${ENTRIES_ID[${fi}]}" == "${target_id}" ]]; then
+      printf -v "${_out}" '%s' "${fi}"
+      return
+    fi
+  done
+  printf -v "${_out}" '%s' "-1"
+}
+
+# ── Command Menu ─────────────────────────────────
+MENU_ACTIVE=0
+MENU_TARGET_ID=""
+MENU_KEYS=()
+MENU_LABELS=()
+
+cs_menu_init() {
+  if [[ "${ENTRIES_TYPE[${SELECTED}]:-}" == "local" ]]; then
+    MENU_KEYS=(p x D "" c v d s)
+    MENU_LABELS=(
+      "Rename project"
+      "Stop"
+      "Remove"
+      ""
+      "New session"
+      "Agent view"
+      "Detach"
+      "Shutdown"
+    )
+  else
+    MENU_KEYS=(p "" c v d s)
+    MENU_LABELS=(
+      "Rename project"
+      ""
+      "New session"
+      "Agent view"
+      "Detach"
+      "Shutdown"
+    )
+  fi
+}
+
+cs_menu_enter() {
+  MENU_ACTIVE=1
+  MENU_TARGET_ID="${ENTRIES_ID[${SELECTED}]}"
+  cs_menu_init
+  DIRTY=1
+}
+
+# ── Search / Filter ──────────────────────────────
+SEARCH_ACTIVE=0
+SEARCH_TERM=""
+SEARCH_FIELD_FOCUSED=0
+FULL_ENTRIES_ID=(); FULL_ENTRIES_NAME=(); FULL_ENTRIES_MTIME=()
+FULL_ENTRIES_STATUS=(); FULL_ENTRIES_SID=(); FULL_ENTRIES_TYPE=(); FULL_ENTRIES_PATH=()
+
+cs_search_save_full() {
+  FULL_ENTRIES_ID=("${ENTRIES_ID[@]}")
+  FULL_ENTRIES_NAME=("${ENTRIES_NAME[@]}")
+  FULL_ENTRIES_MTIME=("${ENTRIES_MTIME[@]}")
+  FULL_ENTRIES_STATUS=("${ENTRIES_STATUS[@]}")
+  FULL_ENTRIES_SID=("${ENTRIES_SID[@]}")
+  FULL_ENTRIES_TYPE=("${ENTRIES_TYPE[@]}")
+  FULL_ENTRIES_PATH=("${ENTRIES_PATH[@]}")
+}
+
+cs_search_apply_filter() {
+  # Capture selected ID for preservation (only when in results, not search field)
+  local selected_id=""
+  if ((!SEARCH_FIELD_FOCUSED)) && ((${#ENTRIES_ID[@]} > 0)) && ((SELECTED < ${#ENTRIES_ID[@]})); then
+    selected_id="${ENTRIES_ID[${SELECTED}]}"
+  fi
+
+  cs_entry_clear
+
+  if [[ -z "${SEARCH_TERM}" ]]; then
+    ENTRIES_ID=("${FULL_ENTRIES_ID[@]}")
+    ENTRIES_NAME=("${FULL_ENTRIES_NAME[@]}")
+    ENTRIES_MTIME=("${FULL_ENTRIES_MTIME[@]}")
+    ENTRIES_STATUS=("${FULL_ENTRIES_STATUS[@]}")
+    ENTRIES_SID=("${FULL_ENTRIES_SID[@]}")
+    ENTRIES_TYPE=("${FULL_ENTRIES_TYPE[@]}")
+    ENTRIES_PATH=("${FULL_ENTRIES_PATH[@]}")
+  else
+    local term="${SEARCH_TERM,,}"
+    local n=${#FULL_ENTRIES_ID[@]}
+
+    # Pass 1: mark matching entries
+    local -a match=()
+    local i
+    for ((i = 0; i < n; i++)); do
+      local type="${FULL_ENTRIES_TYPE[${i}]}"
+      if [[ "${type}" == "header" || "${type}" == "spacer" ]]; then
+        match+=(0)
+      else
+        local name="${FULL_ENTRIES_NAME[${i}],,}"
+        if [[ "${name}" == *"${term}"* ]]; then
+          match+=(1)
+        else
+          match+=(0)
+        fi
+      fi
+    done
+
+    # Pass 2: copy matches, include spacer/header only if section has matches
+    for ((i = 0; i < n; i++)); do
+      local type="${FULL_ENTRIES_TYPE[${i}]}"
+      if [[ "${type}" == "spacer" || "${type}" == "header" ]]; then
+        # Look ahead: any match before next spacer or end?
+        local has_child=0 j
+        for ((j = i + 1; j < n; j++)); do
+          [[ "${FULL_ENTRIES_TYPE[${j}]}" == "spacer" ]] && break
+          ((match[j])) && { has_child=1; break; }
+        done
+        if ((has_child)); then
+          cs_entry_append "${FULL_ENTRIES_ID[${i}]}" "${FULL_ENTRIES_NAME[${i}]}" "${FULL_ENTRIES_MTIME[${i}]}" "${FULL_ENTRIES_STATUS[${i}]}" "${FULL_ENTRIES_SID[${i}]}" "${FULL_ENTRIES_TYPE[${i}]}" "${FULL_ENTRIES_PATH[${i}]}"
+        fi
+      elif ((match[i])); then
+        cs_entry_append "${FULL_ENTRIES_ID[${i}]}" "${FULL_ENTRIES_NAME[${i}]}" "${FULL_ENTRIES_MTIME[${i}]}" "${FULL_ENTRIES_STATUS[${i}]}" "${FULL_ENTRIES_SID[${i}]}" "${FULL_ENTRIES_TYPE[${i}]}" "${FULL_ENTRIES_PATH[${i}]}"
+      fi
+    done
+  fi
+
+  # Restore selection
+  local new_n=${#ENTRIES_ID[@]}
+  if [[ -n "${selected_id}" ]]; then
+    local idx
+    cs_find_entry_index "${selected_id}" idx
+    if [[ "${idx}" != "-1" ]]; then
+      SELECTED=${idx}
+      SCROLL=0
+      return
+    fi
+  fi
+  # Fallback: clamp and skip to nearest selectable
+  if ((new_n == 0)); then
+    SELECTED=0
+  elif ((SELECTED >= new_n)); then
+    SELECTED=$((new_n - 1))
+  fi
+  # Skip past headers/spacers
+  local start=${SELECTED}
+  while ((new_n > 0)) && [[ "${ENTRIES_TYPE[${SELECTED}]}" == "header" || "${ENTRIES_TYPE[${SELECTED}]}" == "spacer" ]]; do
+    SELECTED=$(( (SELECTED + 1) % new_n ))
+    ((SELECTED == start)) && break
+  done
+  SCROLL=0
+}
+
+cs_search_enter() {
+  SEARCH_ACTIVE=1
+  SEARCH_TERM=""
+  SEARCH_FIELD_FOCUSED=1
+  DIRTY=1
+}
+
+cs_search_exit() {
+  # Capture selected ID before restoring full entries
+  local selected_id=""
+  if ((!SEARCH_FIELD_FOCUSED)) && ((${#ENTRIES_ID[@]} > 0)) && ((SELECTED < ${#ENTRIES_ID[@]})); then
+    selected_id="${ENTRIES_ID[${SELECTED}]}"
+  fi
+
+  SEARCH_ACTIVE=0
+  SEARCH_TERM=""
+  SEARCH_FIELD_FOCUSED=0
+
+  # Restore full entries
+  ENTRIES_ID=("${FULL_ENTRIES_ID[@]}")
+  ENTRIES_NAME=("${FULL_ENTRIES_NAME[@]}")
+  ENTRIES_MTIME=("${FULL_ENTRIES_MTIME[@]}")
+  ENTRIES_STATUS=("${FULL_ENTRIES_STATUS[@]}")
+  ENTRIES_SID=("${FULL_ENTRIES_SID[@]}")
+  ENTRIES_TYPE=("${FULL_ENTRIES_TYPE[@]}")
+  ENTRIES_PATH=("${FULL_ENTRIES_PATH[@]}")
+
+  # Remap SELECTED in the full list
+  if [[ -n "${selected_id}" ]]; then
+    local idx
+    cs_find_entry_index "${selected_id}" idx
+    if [[ "${idx}" != "-1" ]]; then
+      SELECTED=${idx}
+      DIRTY=1
+      return
+    fi
+  fi
+  # Fallback: clamp and skip
+  local n=${#ENTRIES_ID[@]}
+  if ((n == 0)); then
+    SELECTED=0
+  elif ((SELECTED >= n)); then
+    SELECTED=$((n - 1))
+  fi
+  local start=${SELECTED}
+  while ((n > 0)) && [[ "${ENTRIES_TYPE[${SELECTED}]}" == "header" || "${ENTRIES_TYPE[${SELECTED}]}" == "spacer" ]]; do
+    SELECTED=$(( (SELECTED + 1) % n ))
+    ((SELECTED == start)) && break
+  done
+  DIRTY=1
+}
+
+cs_search_handle_key() {
+  local key="$1"
+  case "${key}" in
+    $'\e')
+      local seq=""
+      read -rsn2 -t 0.1 seq || true
+      case "${seq}" in
+        '[A') cs_search_move_up; DIRTY=1 ;;
+        '[B') cs_search_move_down; DIRTY=1 ;;
+        '') cs_search_exit; DIRTY=1 ;;
+      esac
+      ;;
+    '')  # Enter
+      local n=${#ENTRIES_ID[@]}
+      # Count selectable entries
+      local selectable=0 first_sel=-1 i
+      for ((i = 0; i < n; i++)); do
+        if [[ "${ENTRIES_TYPE[${i}]}" != "header" && "${ENTRIES_TYPE[${i}]}" != "spacer" ]]; then
+          ((selectable++))
+          ((first_sel == -1)) && first_sel=${i}
+        fi
+      done
+      if ((selectable == 1)); then
+        SEARCH_FIELD_FOCUSED=0
+        SELECTED=${first_sel}
+        cs_search_exit
+        cs_activate_selected
+        cs_focus_session
+        DIRTY=1
+      elif ((selectable > 1)); then
+        SEARCH_FIELD_FOCUSED=0
+        SELECTED=0
+        # Skip to first selectable
+        while [[ "${ENTRIES_TYPE[${SELECTED}]}" == "header" || "${ENTRIES_TYPE[${SELECTED}]}" == "spacer" ]] && ((SELECTED < n - 1)); do
+          ((SELECTED++))
+        done
+        DIRTY=1
+      fi
+      ;;
+    $'\177'|$'\b')  # Backspace
+      if ((${#SEARCH_TERM} > 0)); then
+        SEARCH_TERM="${SEARCH_TERM%?}"
+        cs_search_apply_filter
+      fi
+      DIRTY=1
+      ;;
+    *)
+      # Only append printable characters
+      if [[ "${key}" == [[:print:]] ]]; then
+        SEARCH_TERM+="${key}"
+        cs_search_apply_filter
+        DIRTY=1
+      fi
+      ;;
+  esac
+}
+
+cs_search_move_down() {
+  local n=${#ENTRIES_ID[@]}
+  # Count selectable entries
+  local selectable=0 i
+  for ((i = 0; i < n; i++)); do
+    [[ "${ENTRIES_TYPE[${i}]}" != "header" && "${ENTRIES_TYPE[${i}]}" != "spacer" ]] && ((selectable++))
+  done
+  ((selectable == 0)) && { SEARCH_FIELD_FOCUSED=1; return; }
+
+  if ((SEARCH_FIELD_FOCUSED)); then
+    SEARCH_FIELD_FOCUSED=0
+    SELECTED=0
+    while [[ "${ENTRIES_TYPE[${SELECTED}]}" == "header" || "${ENTRIES_TYPE[${SELECTED}]}" == "spacer" ]] && ((SELECTED < n - 1)); do
+      ((SELECTED++))
+    done
+  else
+    local old=${SELECTED}
+    cs_move_down
+    if ((SELECTED <= old)); then
+      SEARCH_FIELD_FOCUSED=1
+    fi
+  fi
+}
+
+cs_search_move_up() {
+  local n=${#ENTRIES_ID[@]}
+  # Count selectable entries
+  local selectable=0 i
+  for ((i = 0; i < n; i++)); do
+    [[ "${ENTRIES_TYPE[${i}]}" != "header" && "${ENTRIES_TYPE[${i}]}" != "spacer" ]] && ((selectable++))
+  done
+  ((selectable == 0)) && { SEARCH_FIELD_FOCUSED=1; return; }
+
+  if ((SEARCH_FIELD_FOCUSED)); then
+    SEARCH_FIELD_FOCUSED=0
+    SELECTED=$((n - 1))
+    while [[ "${ENTRIES_TYPE[${SELECTED}]}" == "header" || "${ENTRIES_TYPE[${SELECTED}]}" == "spacer" ]] && ((SELECTED > 0)); do
+      ((SELECTED--))
+    done
+  else
+    local old=${SELECTED}
+    cs_move_up
+    if ((SELECTED >= old)); then
+      SEARCH_FIELD_FOCUSED=1
+    fi
+  fi
+}
+
+cs_fingerprint() {
+  local _out="$1" _pf="${2:-}"
+  [[ -n "${_pf}" ]] || _pf=$(_tmux display-message -t "${PICKER_PANE}" -p '#{pane_active}' 2>/dev/null || echo "1")
+  local _fpv="focus:${_pf}|menu:${MENU_ACTIVE}|search:${SEARCH_ACTIVE}:${SEARCH_TERM}:${SEARCH_FIELD_FOCUSED}|"
+  _fpv+="shown:${SHOWN}|msg:${FOOTER_MSG}|err:${POLL_ERROR}|"
+  local i
+  for ((i = 0; i < ${#ENTRIES_ID[@]}; i++)); do
+    _fpv+="${ENTRIES_ID[${i}]}:${ENTRIES_STATUS[${i}]}:${ENTRIES_MTIME[${i}]}:${ENTRIES_NAME[${i}]}:"
+    _fpv+="${UNSEEN_SET[${ENTRIES_ID[${i}]}]:-0}|"
+  done
+  printf -v "${_out}" '%s' "${_fpv}"
+}
+
+# ── Age Formatting ────────────────────────────────
+cs_format_age() {
+  local diff=$((NOW - $1)) _out="$2"
+  if ((diff < 60)); then
+    printf -v "${_out}" '%s' "<1m"
+  elif ((diff < 3600)); then
+    printf -v "${_out}" '%s' "$((diff / 60))m"
+  elif ((diff < 86400)); then
+    printf -v "${_out}" '%s' "$((diff / 3600))h"
+  elif ((diff < 604800)); then
+    printf -v "${_out}" '%s' "$((diff / 86400))d"
+  else
+    printf -v "${_out}" '%s' "$((diff / 604800))w"
+  fi
+}
+
+# ── Client Pane ───────────────────────────────────
+# One pane next to the picker shows whatever is being looked at: the welcome
+# screen, a session (`claude attach`) or agent view (`claude agents`). It lives as
+# long as the server. Claude's supervisor owns the sessions; killing the client
+# never stops one.
+
+# Write the two scripts the client pane runs. The project path is baked in, so
+# only the fixed words `attach`/`agents` and a validated id ever reach a command line.
+cs_client_write_scripts() {
+  local welcome="${STATE_DIR}/welcome.sh" client="${STATE_DIR}/client.sh"
+  {
+    echo '#!/usr/bin/env bash'
+    echo "printf '\\033]2;%s\\033\\\\' '${CS_T_WELCOME}'"
+    echo 'clear'
+    echo 'echo ""'
+    echo 'echo "  claude-agents"'
+    echo 'echo "  ─────────────────"'
+    local _wname="${PROJECT_NAMES[${PWD_SANITIZED}]:-${DISPLAY_NAMES[${PWD}]:-${PWD##*/}}}"
+    printf 'echo %q\n' "  Project: ${_wname} (${PWD})"
+    echo 'echo ""'
+    echo 'echo "  Select a session in the picker, or press :c for a new one."'
+    echo 'echo "  :v opens agent view; /resume there brings back older conversations."'
+    echo 'echo ""'
+    cs_help_text | while IFS= read -r line; do
+      line="${line//\\/\\\\}"
+      line="${line//\"/\\\"}"
+      line="${line//\`/\\\`}"
+      line="${line//\$/\\\$}"
+      line="${line//>/\\>}"
+      echo "echo \"${line}\""
+    done
+    echo "${CS_SLEEP_CMD}"
+  } > "${welcome}"
+  {
+    echo '#!/usr/bin/env bash'
+    echo '# $1 = attach | agents, $2 = job id'
+    echo 'export CLAUDE_CODE_DISABLE_AGENT_VIEW=0'
+    # From the project root: /resume in agent view lists the repository it was opened from.
+    printf 'if cd %q; then\n' "${PWD}"
+    echo '  if [[ "$1" == "agents" ]]; then'
+    echo '    claude agents'
+    echo '  else'
+    echo '    claude attach "$2"'
+    echo '  fi'
+    echo '  rc=$?'
+    echo 'else'
+    echo '  rc=1'
+    echo 'fi'
+    # tmux keeps the title after claude exits; without this the picker would go on
+    # believing the session is shown.
+    echo "printf '\\033]2;%s\\033\\\\' '${CS_T_WELCOME}'"
+    echo 'if ((rc)); then'
+    echo '  # a client that failed leaves its message on screen'
+    echo "  ${CS_SLEEP_CMD}"
+    echo 'fi'
+    printf 'exec %q\n' "${welcome}"
+  } > "${client}"
+  chmod +x "${welcome}" "${client}"
+}
+
+cs_set_displayed() {
+  DISPLAYED="$1"
+  echo "${DISPLAYED}" > "${STATE_DIR}/displayed"
+}
+
+# Create the client pane beside the picker if it is missing or dead.
+cs_client_ensure() {
+  cs_read_state_into CLIENT_PANE client_pane
+  cs_refresh_pane_cache
+  if [[ -n "${CLIENT_PANE}" ]] && cs_pane_alive "${CLIENT_PANE}"; then
+    return 0
+  fi
+  CLIENT_PANE=""
+  # split-window -t "" splits the ACTIVE pane.
+  [[ -n "${PICKER_PANE:-}" ]] || return 1
+  local side_flag=""
+  [[ "${PICKER_SIDE}" == "right" ]] && side_flag="-b"
+  local pane
+  pane=$(_tmux split-window -h ${side_flag} -d -t "${PICKER_PANE}" \
+          -P -F '#{pane_id}' "${STATE_DIR}/welcome.sh" 2>/dev/null) || return 1
+  [[ -n "${pane}" ]] || return 1
+  CLIENT_PANE="${pane}"
+  echo "${CLIENT_PANE}" > "${STATE_DIR}/client_pane"
+  _tmux select-pane -t "${CLIENT_PANE}" -T "${CS_T_WELCOME}" \; \
+        resize-pane -t "${PICKER_PANE}" -x "${PICKER_WIDTH}" 2>/dev/null || true
+  cs_set_displayed ""
+  SHOWN=""
+}
+
+# The only way the client pane is ever respawned. The marker title is set in the
+# same tmux call: tmux keeps a title across respawn-pane, and a stale one would
+# make cs_follow adopt the session that was just left.
+cs_client_respawn() {
+  local marker="$1" cmd="$2"
+  # respawn-pane -t "" and select-pane -t "" both act on the ACTIVE pane, which
+  # can be the picker.
+  [[ -n "${CLIENT_PANE:-}" && -n "${marker}" && -n "${cmd}" ]] || return 1
+  [[ "${CLIENT_PANE}" != "${PICKER_PANE:-}" ]] || return 1
+  _tmux select-pane -t "${CLIENT_PANE}" -T "${marker}" \; \
+        respawn-pane -k -t "${CLIENT_PANE}" "${cmd}" 2>/dev/null
+}
+
+cs_show_welcome() {
+  cs_set_displayed ""
+  SHOWN=""
+  cs_client_respawn "${CS_T_WELCOME}" "${STATE_DIR}/welcome.sh" || cs_client_ensure
+  # Only now, with no client attached, does the terminal leave the window.
+  cs_term_park_shown
+}
+
+# Show session $1 in the client pane. `claude attach` sets no title, so the
+# switching marker stays and shown is set here, not read back from tmux.
+cs_show_session() {
+  local id="$1"
+  [[ "${id}" =~ ${ID_RE} ]] || return 1
+  [[ "${id}" == "${SHOWN}" ]] && return 0
+  [[ -n "${SHOWN}" ]] && cs_mark_seen "${SHOWN}"
+  local cmd="${STATE_DIR}/client.sh attach ${id}"
+  if ! cs_switch_chain "${id}" "${cmd}"; then
+    # tmux stopped part-way: a placeholder may be all that is left in the client
+    # pane. Back to the welcome screen, with nothing displayed and no slot left.
+    cs_show_welcome
+    cs_slot_sweep
+    return 1
+  fi
+  cs_set_displayed "${id}"
+  SHOWN="${id}"
+  cs_cleanup_new_session "${id}"
+  return 0
+}
+
+# Agent view is not an exit: displayed stays, and only shown goes empty.
+cs_open_agents() {
+  [[ -n "${SHOWN}" ]] && cs_mark_seen "${SHOWN}"
+  if cs_client_respawn "${CS_T_AGENTS}" "${STATE_DIR}/client.sh agents"; then
+    SHOWN=""
+    _tmux select-pane -t "${CLIENT_PANE}" 2>/dev/null || true
+  else
+    cs_client_ensure
+  fi
+}
+
+# Focus the client pane
+cs_focus_session() {
+  if [[ -n "${CLIENT_PANE}" ]] && cs_pane_alive "${CLIENT_PANE}"; then
+    _tmux select-pane -t "${CLIENT_PANE}"
+  fi
+}
+
+# What the client shows when the picker starts, which includes a reload. After a
+# switch the title is still the switching marker, so only `displayed` remembers it.
+cs_shown_at_startup() {
+  if [[ "${CLIENT_TITLE}" == "${CS_T_SWITCHING}" ]]; then
+    SHOWN="${DISPLAYED}"
+  else
+    SHOWN=""
+  fi
+}
+
+# Read what the client pane shows from its title. The left arrow takes the client
+# to agent view, where any session can be opened without the picker knowing.
+cs_follow() {
+  local title="${CLIENT_TITLE}"
+  [[ -n "${title}" ]] || return 0
+  local prev="${SHOWN}"
+  case "${title}" in
+    "${CS_T_SWITCHING}")
+      # a switch made here: shown was set by it
+      return 0
+      ;;
+    "${CS_T_WELCOME}")
+      # the welcome screen, or a client that exited
+      SHOWN=""
+      if [[ -n "${DISPLAYED}" ]]; then
+        cs_set_displayed ""
+        cs_term_park_shown
+        _tmux select-pane -t "${PICKER_PANE}" 2>/dev/null || true
+      fi
+      ;;
+    "${CS_T_AGENTS}"|"claude agents"|*" · claude agents")
+      SHOWN=""
+      ;;
+    *)
+      # A session opened from agent view carries its name as title. Anything else,
+      # or a name two sessions share, means nothing: leave shown as it is.
+      local id found="" count=0
+      for id in "${AG_IDS[@]}"; do
+        if [[ "${AG_NAME[${id}]}" == "${title}" ]]; then
+          found="${id}"
+          count=$((count + 1))
+        fi
+      done
+      if ((count == 1)); then
+        SHOWN="${found}"
+        if [[ "${AG_CWD[${found}]%%/.claude/worktrees/*}" == "${PWD}" && "${found}" != "${DISPLAYED}" ]]; then
+          # Adopt it, and bring its terminal. The attach already happened, so the
+          # session is resized once; there is no way around that here.
+          cs_term_park_shown
+          cs_set_displayed "${found}"
+          if cs_term_is_shown "${found}"; then
+            local _fo
+            cs_term_orient _fo "${found}"
+            cs_term_show "${found}" "${_fo}" || true
+          fi
+        fi
+      fi
+      ;;
+  esac
+  if [[ "${prev}" != "${SHOWN}" ]]; then
+    # once more as it stops being shown, so a turn that ended in the last second
+    # the user was looking is not flagged
+    [[ -n "${prev}" ]] && cs_mark_seen "${prev}"
+    DIRTY=1
+  fi
+}
+
+# One scan: read tmux, follow the client, refresh the list when due, rebuild rows.
+cs_tick() {
+  cs_refresh_pane_cache
+  if [[ -z "${CLIENT_PANE}" ]] || ! cs_pane_alive "${CLIENT_PANE}"; then
+    cs_client_ensure
+    cs_refresh_pane_cache
+  fi
+  cs_term_reconcile
+  cs_follow
+  if [[ -n "${SHOWN}" ]] && ((WINDOW_FOCUSED)); then
+    cs_mark_seen "${SHOWN}"
+  fi
+  cs_poll_tick
+  # The displayed session left the list (removed somewhere else).
+  if [[ -n "${DISPLAYED}" && -z "${POLL_ERROR}" ]] && ((POLLED)) && [[ ! -v "AG_STATE[${DISPLAYED}]" ]]; then
+    cs_show_welcome
+    _tmux select-pane -t "${PICKER_PANE}" 2>/dev/null || true
+  fi
+  # A new session that got its first prompt is no longer ours to clean up.
+  local nid
+  cs_read_state_into nid new_session
+  if [[ -n "${nid}" && -v "AG_STATE[${nid}]" ]]; then
+    if [[ "${AG_STATE[${nid}]}" != "blocked" || "${AG_STATUS[${nid}]}" != "idle" ]]; then
+      rm -f "${STATE_DIR}/new_session"
+    fi
+  fi
+  cs_rescan
+}
+
+# ── Terminal Panes ────────────────────────────────
+# One terminal per session, keyed by job id. Only the displayed session's terminal
+# is in the main window, split off the client pane. Every other one is parked in a
+# hidden window pinned to the terminal's own size. A terminal only ever moves
+# between cells of its own size, so parking and switching never resize it.
+#
+# State, in ${STATE_DIR}/term/:
+#   <id>          the terminal's pane id
+#   <id>.shown    present: visible whenever its session is displayed
+#   <id>.orient   bottom | side
+#   <id>.height   saved share, e.g. 35% (only with a percentage setting)
+#   <id>.width
+#   <id>.keep     present: a fixed-size terminal that was opened without room
+#   <id>.area     the client pane's size without the terminal, WxH, when the
+#                 terminal was last in the main window
+
+declare -gA PANE_W PANE_H PANE_WIN
+declare -gA TERM_ABSENT
+TERM_HOW=()
+FULL_W=0
+FULL_H=0
+
+# Size and window of every pane, from one list-panes call. display-message -t
+# answers for the active pane when its target is gone, so it is no use here.
+cs_refresh_geom() {
+  PANE_W=()
+  PANE_H=()
+  PANE_WIN=()
+  local p w h win
+  while read -r p w h win; do
+    [[ -n "${p}" ]] || continue
+    PANE_W["${p}"]="${w}"
+    PANE_H["${p}"]="${h}"
+    PANE_WIN["${p}"]="${win}"
+  done < <(_tmux list-panes -a -F '#{pane_id} #{pane_width} #{pane_height} #{window_id}' 2>/dev/null)
+}
+
+# True when pane $1 exists and sits in the picker's window. Needs cs_refresh_geom.
+cs_term_in_main() {
+  [[ -n "${1:-}" && -n "${PANE_WIN[$1]:-}" && "${PANE_WIN[$1]}" == "${PANE_WIN[${PICKER_PANE}]:-none}" ]]
+}
+
+cs_term_is_shown() {
+  [[ -f "${STATE_DIR}/term/$1.shown" ]]
+}
+
+# Orientation of session $2's terminal, into the variable named $1.
+cs_term_orient() {
+  local _to
+  cs_read_state_into _to "term/$2.orient"
+  [[ "${_to}" == "side" ]] || _to="bottom"
+  printf -v "$1" '%s' "${_to}"
+}
+
+# The tmux flags that put a terminal beside the client pane: below it, or on the
+# side away from the picker. Into TERM_HOW.
+cs_term_how() {
+  if [[ "$1" == "side" ]]; then
+    TERM_HOW=(-h)
+    [[ "${PICKER_SIDE}" == "right" ]] && TERM_HOW+=(-b)
+  else
+    TERM_HOW=(-v)
+  fi
+}
+
+# What a new terminal runs: a shell in the session's own directory, so a session
+# working in a worktree gets a shell in that worktree.
+cs_term_command() {
+  local dir="${AG_CWD[$1]:-}" _sh="${SHELL:-/bin/bash}"
+  [[ -d "${dir}" ]] || dir="${PWD}"
+  printf 'cd %s && exec %s' "${dir@Q}" "${_sh@Q}"
+}
+
+# Height of session $1's bottom terminal when the client pane is $2 rows tall
+# without it.
+cs_term_compute_height() {
+  local id="$1" pane_h="$2"
+  local h="${TERMINAL_HEIGHT}" saved
+  if [[ "${h}" == *% ]]; then
+    cs_read_state_into saved "term/${id}.height"
+    [[ "${saved}" =~ ^[0-9]+%$ ]] && h="${saved}"
+  fi
+  if [[ "${h}" == *% ]]; then
+    h=$(( (pane_h * ${h%\%} + 50) / 100 ))
+  fi
+  local max_h=$(( pane_h - MIN_CLAUDE_HEIGHT - 1 ))
+  rm -f "${STATE_DIR}/term/${id}.keep"
+  if (( h > max_h )); then
+    h="${max_h}"
+    # a fixed size opened without room: a resize squeezes it instead of hiding it
+    [[ "${TERMINAL_HEIGHT}" == *% ]] || echo "1" > "${STATE_DIR}/term/${id}.keep"
+  fi
+  (( h < 3 )) && h=3
+  echo "${h}"
+}
+
+# Width of session $1's side terminal when the client pane is $2 columns wide
+# without it.
+cs_term_compute_width() {
+  local id="$1" pane_w="$2"
+  local w="${TERMINAL_WIDTH}" saved
+  if [[ "${w}" == *% ]]; then
+    cs_read_state_into saved "term/${id}.width"
+    [[ "${saved}" =~ ^[0-9]+%$ ]] && w="${saved}"
+  fi
+  if [[ "${w}" == *% ]]; then
+    w=$(( (pane_w * ${w%\%} + 50) / 100 ))
+  fi
+  local max_w=$(( pane_w - MIN_CLAUDE_WIDTH - 1 ))
+  rm -f "${STATE_DIR}/term/${id}.keep"
+  if (( w > max_w )); then
+    w="${max_w}"
+    [[ "${TERMINAL_WIDTH}" == *% ]] || echo "1" > "${STATE_DIR}/term/${id}.keep"
+  fi
+  (( w < 10 )) && w=10
+  echo "${w}"
+}
+
+# Size for session $1's terminal in orientation $2 when the client pane, with no
+# terminal beside it, is $3 x $4. A parked terminal ($5) keeps its own size as
+# long as that area is the one it was parked from, and it was parked in this
+# orientation: recomputing from the saved share can land a cell off, and that
+# would resize it on every switch. After the window changed, its size is stale
+# and is computed again.
+cs_term_place_size() {
+  local id="$1" orient="$2" full_w="$3" full_h="$4" tp="${5:-}" area=""
+  if [[ -n "${tp}" ]]; then
+    cs_read_state_into area "term/${id}.area"
+    [[ "${area}" == "${full_w}x${full_h}" ]] || tp=""
+  fi
+  if [[ "${orient}" == "side" ]]; then
+    if [[ -n "${tp}" && "${PANE_H[${tp}]:-}" == "${full_h}" ]]; then
+      echo "${PANE_W[${tp}]}"
+      return 0
+    fi
+    cs_term_compute_width "${id}" "${full_w}"
+  else
+    if [[ -n "${tp}" && "${PANE_W[${tp}]:-}" == "${full_w}" ]]; then
+      echo "${PANE_H[${tp}]}"
+      return 0
+    fi
+    cs_term_compute_height "${id}" "${full_h}"
+  fi
+}
+
+# The size the client pane has with no terminal beside it, into FULL_W and
+# FULL_H. $1 is the terminal now in the main window ("" for none), $2 its
+# orientation. Needs cs_refresh_geom.
+cs_client_full_size() {
+  FULL_W="${PANE_W[${CLIENT_PANE}]:-0}"
+  FULL_H="${PANE_H[${CLIENT_PANE}]:-0}"
+  [[ -n "${1:-}" && -n "${PANE_W[$1]:-}" ]] || return 0
+  if [[ "$2" == "side" ]]; then
+    FULL_W=$(( FULL_W + PANE_W[$1] + 1 ))
+  else
+    FULL_H=$(( FULL_H + PANE_H[$1] + 1 ))
+  fi
+}
+
+# Remember the area session $1's terminal sits in, and the share of it the
+# terminal takes, so a resize of the outer terminal keeps it. Only a percentage
+# setting has its share saved, and never a split that has squeezed Claude to its
+# minimum. Needs cs_refresh_geom.
+cs_term_save_size() {
+  local id="$1" tp orient
+  cs_read_state_into tp "term/${id}"
+  cs_term_in_main "${tp}" || return 0
+  [[ -n "${PANE_W[${CLIENT_PANE}]:-}" ]] || return 0
+  cs_term_orient orient "${id}"
+  cs_client_full_size "${tp}" "${orient}"
+  echo "${FULL_W}x${FULL_H}" > "${STATE_DIR}/term/${id}.area"
+  if [[ "${orient}" == "side" ]]; then
+    [[ "${TERMINAL_WIDTH}" == *% ]] || return 0
+    local tw="${PANE_W[${tp}]}" sw="${PANE_W[${CLIENT_PANE}]}"
+    if (( tw + sw > 0 && sw > MIN_CLAUDE_WIDTH )); then
+      echo "$(( tw * 100 / (tw + sw) ))%" > "${STATE_DIR}/term/${id}.width"
+    fi
+  else
+    [[ "${TERMINAL_HEIGHT}" == *% ]] || return 0
+    local th="${PANE_H[${tp}]}" sh="${PANE_H[${CLIENT_PANE}]}"
+    if (( th + sh > 0 && sh > MIN_CLAUDE_HEIGHT )); then
+      echo "$(( th * 100 / (th + sh) ))%" > "${STATE_DIR}/term/${id}.height"
+    fi
+  fi
+}
+
+# A hidden window holding one tagged placeholder, pinned to the size of pane $1.
+# Prints the placeholder's pane id.
+cs_slot_for() {
+  local tp="$1" slot
+  [[ -n "${tp}" && -n "${PANE_W[${tp}]:-}" ]] || return 1
+  slot=$(_tmux new-window -d -P -F '#{pane_id}' "${CS_SLEEP_CMD}" 2>/dev/null) || return 1
+  [[ -n "${slot}" ]] || return 1
+  # An untagged placeholder is invisible to cs_slot_sweep — never leave one.
+  if ! _tmux set -p -t "${slot}" @ca_placeholder 1 \; \
+             resize-window -t "${slot}" -x "${PANE_W[${tp}]}" -y "${PANE_H[${tp}]}" 2>/dev/null; then
+    _tmux kill-pane -t "${slot}" 2>/dev/null || true
+    return 1
+  fi
+  printf '%s\n' "${slot}"
+}
+
+cs_slot_discard() {
+  # kill-pane -t "" kills the ACTIVE pane.
+  [[ -n "${1:-}" ]] || return 0
+  _tmux kill-pane -t "$1" 2>/dev/null || true
+}
+
+# Kill windows whose panes are all tagged placeholders: a slot left behind by a
+# chain that failed. A parked terminal is never tagged, so its window is spared.
+cs_slot_sweep() {
+  local -A wtot wtag wrep
+  local wid pid flag
+  while read -r wid pid flag; do
+    [[ -n "${wid}" ]] || continue
+    wtot["${wid}"]=$(( ${wtot["${wid}"]:-0} + 1 ))
+    if [[ "${flag}" == "1" ]]; then
+      wtag["${wid}"]=$(( ${wtag["${wid}"]:-0} + 1 ))
+      wrep["${wid}"]="${pid}"
+    fi
+  done < <(_tmux list-panes -a -F '#{window_id} #{pane_id} #{?@ca_placeholder,1,0}' 2>/dev/null)
+  for wid in "${!wtot[@]}"; do
+    (( wtot["${wid}"] == ${wtag["${wid}"]:-0} )) || continue
+    [[ -n "${wrep["${wid}"]:-}" ]] || continue
+    _tmux kill-window -t "${wrep["${wid}"]}" 2>/dev/null || true
+  done
+}
+
+# Park terminal pane $1 in a hidden window pinned to its own size. It moves by
+# swap-pane into a cell of exactly that size, so it is not resized. break-pane
+# would put it in a full-size window, and resizing the window afterwards does not
+# undo that. Needs cs_refresh_geom.
+cs_term_park() {
+  local tp="$1" slot
+  slot=$(cs_slot_for "${tp}") || return 1
+  if ! _tmux swap-pane -d -s "${tp}" -t "${slot}" \; kill-pane -t "${slot}" 2>/dev/null; then
+    cs_slot_discard "${slot}"
+    return 1
+  fi
+  cs_rename_pane_window "${tp}" "ca:term"
+}
+
+# Park whatever terminal is in the main window. Call it when no client is
+# attached (the welcome screen, a client that exited), or when the resize it
+# causes cannot be avoided (a session opened from agent view).
+cs_term_park_shown() {
+  local f id tp
+  cs_refresh_geom
+  for f in "${STATE_DIR}"/term/*; do
+    [[ -f "${f}" ]] || continue
+    id="${f##*/}"
+    [[ "${id}" == *.* ]] && continue
+    { tp=$(< "${f}"); } 2>/dev/null
+    cs_term_in_main "${tp}" || continue
+    cs_term_save_size "${id}"
+    cs_term_park "${tp}" || true
+  done
+}
+
+# Forget session $1's terminal: its state files, not the pane.
+cs_term_forget() {
+  [[ "$1" =~ ${ID_RE} ]] || return 0
+  rm -f "${STATE_DIR}/term/$1"{,.shown,.height,.width,.orient,.keep,.area}
+}
+
+# Kill session $1's terminal and forget it.
+cs_term_kill() {
+  local id="$1" tp
+  [[ "${id}" =~ ${ID_RE} ]] || return 0
+  cs_read_state_into tp "term/${id}"
+  # kill-pane -t "" kills the ACTIVE pane.
+  if [[ -n "${tp}" ]]; then
+    _tmux kill-pane -t "${tp}" 2>/dev/null || true
+  fi
+  cs_term_forget "${id}"
+}
+
+# Drop the state of terminals whose shell has exited: closing the shell closes
+# the terminal. Needs a fresh cs_refresh_pane_cache.
+cs_term_reconcile() {
+  # an empty pane list is a failed tmux call, not a server with no panes
+  cs_pane_alive "${PICKER_PANE:-none}" || return 0
+  local f id tp
+  for f in "${STATE_DIR}"/term/*; do
+    [[ -f "${f}" ]] || continue
+    id="${f##*/}"
+    [[ "${id}" == *.* ]] && continue
+    { tp=$(< "${f}"); } 2>/dev/null
+    if [[ -z "${tp}" ]] || ! cs_pane_alive "${tp}"; then
+      cs_term_forget "${id}"
+    fi
+  done
+}
+
+# Kill the terminals of sessions that are gone for good: missing from five
+# successful polls in a row. A terminal can hold a running process, so one
+# missing entry proves nothing, and neither does a failed poll: this is called
+# only after a successful one.
+cs_term_sweep() {
+  local f id
+  for f in "${STATE_DIR}"/term/*; do
+    [[ -f "${f}" ]] || continue
+    id="${f##*/}"
+    [[ "${id}" == *.* ]] && continue
+    if [[ -v "AG_STATE[${id}]" ]]; then
+      unset "TERM_ABSENT[${id}]"
+      continue
+    fi
+    TERM_ABSENT["${id}"]=$(( ${TERM_ABSENT[${id}]:-0} + 1 ))
+    if ((TERM_ABSENT[${id}] >= 5)); then
+      cs_term_kill "${id}"
+      unset "TERM_ABSENT[${id}]"
+    fi
+  done
+}
+
+# Put session $1's terminal in the main window in orientation $2: create it,
+# bring it out of its parking window, or move it to the other side. A client is
+# attached while this runs, so the session is resized once; that is the user's
+# own action. The terminal itself is resized only when its shape changes.
+cs_term_show() {
+  local id="$1" orient="$2" tp cur size
+  [[ "${id}" =~ ${ID_RE} ]] || return 1
+  # split-window -t "" and join-pane -t "" act on the ACTIVE pane.
+  [[ -n "${CLIENT_PANE}" ]] || return 1
+  cs_refresh_pane_cache
+  cs_term_reconcile
+  cs_refresh_geom
+  cs_read_state_into tp "term/${id}"
+  if cs_term_in_main "${tp}"; then
+    cs_term_orient cur "${id}"
+    if [[ "${cur}" == "${orient}" ]]; then
+      echo "1" > "${STATE_DIR}/term/${id}.shown"
+      return 0
+    fi
+    # the other orientation: out, then back in
+    cs_term_save_size "${id}"
+    cs_term_park "${tp}" || return 1
+    cs_refresh_geom
+  fi
+  cs_client_full_size "" ""
+  size=$(cs_term_place_size "${id}" "${orient}" "${FULL_W}" "${FULL_H}" "${tp}")
+  cs_term_how "${orient}"
+  if [[ -n "${tp}" ]]; then
+    _tmux join-pane "${TERM_HOW[@]}" -d -s "${tp}" -t "${CLIENT_PANE}" -l "${size}" 2>/dev/null || return 1
+  else
+    tp=$(_tmux split-window "${TERM_HOW[@]}" -d -t "${CLIENT_PANE}" -l "${size}" \
+          -P -F '#{pane_id}' "$(cs_term_command "${id}")" 2>/dev/null) || return 1
+    [[ -n "${tp}" ]] || return 1
+    echo "${tp}" > "${STATE_DIR}/term/${id}"
+  fi
+  echo "1" > "${STATE_DIR}/term/${id}.shown"
+  echo "${orient}" > "${STATE_DIR}/term/${id}.orient"
+  _tmux resize-pane -t "${PICKER_PANE}" -x "${PICKER_WIDTH}" 2>/dev/null || true
+  # the share it starts with, so the WINCH handler can keep it
+  cs_refresh_geom
+  cs_term_save_size "${id}"
+}
+
+# Hide session $1's terminal: park it, and remember that it is hidden.
+cs_term_hide() {
+  local id="$1" tp
+  [[ "${id}" =~ ${ID_RE} ]] || return 0
+  rm -f "${STATE_DIR}/term/${id}.shown"
+  cs_refresh_geom
+  cs_read_state_into tp "term/${id}"
+  cs_term_in_main "${tp}" || return 0
+  cs_term_save_size "${id}"
+  cs_term_park "${tp}"
+}
+
+# Hide a terminal a resize left no room for. Focus goes to Claude if it was there.
+cs_term_autohide() {
+  local id="$1" tp="$2" active
+  active=$(_tmux display-message -p '#{pane_id}' 2>/dev/null || true)
+  cs_term_hide "${id}"
+  # the resize squeezed it before it was hidden: that size is not one to keep
+  rm -f "${STATE_DIR}/term/${id}.area"
+  if [[ "${active}" == "${tp}" ]]; then
+    _tmux select-pane -t "${CLIENT_PANE}" 2>/dev/null || true
+  fi
+}
+
+# Toggle the displayed session's terminal on and off.
+cs_term_toggle() {
+  local id="${DISPLAYED}" orient tp
+  # nothing displayed: the welcome screen has no terminal
+  [[ -n "${id}" ]] || return 0
+  if cs_term_is_shown "${id}"; then
+    cs_term_hide "${id}"
+  else
+    cs_term_orient orient "${id}"
+    cs_term_show "${id}" "${orient}" || return 0
+    cs_read_state_into tp "term/${id}"
+    if [[ -n "${tp}" ]]; then
+      _tmux select-pane -t "${tp}" 2>/dev/null || true
+    fi
+  fi
+  _tmux resize-pane -t "${PICKER_PANE}" -x "${PICKER_WIDTH}" 2>/dev/null || true
+}
+
+# Smart terminal key for the displayed session: closed or in the other
+# orientation → open it there and focus it; focused → focus Claude; open but not
+# focused → focus it. $1 is the orientation asked for, empty for the saved one.
+cs_term_smart() {
+  local orient="${1:-}" id="${DISPLAYED}" cur tp active
+  [[ -n "${id}" ]] || return 0
+  cs_term_orient cur "${id}"
+  [[ -n "${orient}" ]] || orient="${cur}"
+  if ! cs_term_is_shown "${id}" || [[ "${cur}" != "${orient}" ]]; then
+    cs_term_show "${id}" "${orient}" || return 0
+    cs_read_state_into tp "term/${id}"
+    if [[ -n "${tp}" ]]; then
+      _tmux select-pane -t "${tp}" 2>/dev/null || true
+    fi
+    return 0
+  fi
+  cs_read_state_into tp "term/${id}"
+  [[ -n "${tp}" ]] || return 0
+  active=$(_tmux display-message -p '#{pane_id}' 2>/dev/null || true)
+  if [[ "${active}" == "${tp}" ]]; then
+    _tmux select-pane -t "${CLIENT_PANE}" 2>/dev/null || true
+  else
+    _tmux select-pane -t "${tp}" 2>/dev/null || true
+  fi
+}
+
+# Run the one tmux call that puts session $1 in the client pane with command $2.
+# Which call depends on the terminals of the session being left and the one
+# being shown:
+#   neither has one in play     respawn the client
+#   same orientation and size   the two terminals trade places, then respawn
+#   anything else               the client pane's size has to change, so a
+#                               placeholder holds it while the terminals move
+# A switch never changes geometry while a client is attached, and never resizes
+# a terminal. It must stay ONE tmux call: split up, the placeholder is visible
+# and the pane's old title can be read.
+cs_switch_chain() {
+  local id="$1" cmd="$2"
+  cs_refresh_pane_cache
+  if [[ -z "${CLIENT_PANE}" ]] || ! cs_pane_alive "${CLIENT_PANE}"; then
+    cs_client_ensure || return 1
+    cs_refresh_pane_cache
+  fi
+  cs_term_reconcile
+  cs_refresh_geom
+
+  local out="${DISPLAYED}" out_tp="" out_orient="bottom" in_tp="" in_orient="bottom"
+  if [[ -n "${out}" && "${out}" != "${id}" ]]; then
+    cs_read_state_into out_tp "term/${out}"
+    cs_term_in_main "${out_tp}" || out_tp=""
+    cs_term_orient out_orient "${out}"
+  fi
+  if [[ "${out}" != "${id}" ]] && cs_term_is_shown "${id}"; then
+    cs_read_state_into in_tp "term/${id}"
+    cs_term_orient in_orient "${id}"
+    # a parked terminal is the only thing to bring in
+    if [[ -z "${PANE_W[${in_tp:-none}]:-}" ]] || cs_term_in_main "${in_tp}"; then
+      in_tp=""
+    fi
+  fi
+
+  local -a chain=(select-pane -t "${CLIENT_PANE}" -T "${CS_T_SWITCHING}" ';')
+  local slot="" size
+  if [[ -z "${out_tp}" && -z "${in_tp}" ]]; then
+    :
+  elif [[ -n "${out_tp}" && -n "${in_tp}" && "${in_orient}" == "${out_orient}" \
+          && "${PANE_W[${in_tp}]}" == "${PANE_W[${out_tp}]}" \
+          && "${PANE_H[${in_tp}]}" == "${PANE_H[${out_tp}]}" ]]; then
+    cs_term_save_size "${out}"
+    chain+=(swap-pane -d -s "${in_tp}" -t "${out_tp}" ';')
+  else
+    cs_client_full_size "${out_tp}" "${out_orient}"
+    chain+=(respawn-pane -k -t "${CLIENT_PANE}" "${CS_SLEEP_CMD}" ';')
+    if [[ -n "${out_tp}" ]]; then
+      cs_term_save_size "${out}"
+      slot=$(cs_slot_for "${out_tp}") || return 1
+      chain+=(swap-pane -d -s "${out_tp}" -t "${slot}" ';' kill-pane -t "${slot}" ';')
+    fi
+    if [[ -n "${in_tp}" ]]; then
+      size=$(cs_term_place_size "${id}" "${in_orient}" "${FULL_W}" "${FULL_H}" "${in_tp}")
+      cs_term_how "${in_orient}"
+      chain+=(join-pane "${TERM_HOW[@]}" -d -s "${in_tp}" -t "${CLIENT_PANE}" -l "${size}" ';')
+    fi
+    chain+=(resize-pane -t "${PICKER_PANE}" -x "${PICKER_WIDTH}" ';')
+  fi
+  chain+=(respawn-pane -k -t "${CLIENT_PANE}" "${cmd}")
+
+  if ! _tmux "${chain[@]}" 2>/dev/null; then
+    cs_slot_discard "${slot}"
+    return 1
+  fi
+  if [[ -n "${out_tp}" ]]; then
+    cs_rename_pane_window "${out_tp}" "ca:term"
+  fi
+  return 0
+}
+
+# ── Jump Numbers ──────────────────────────────────
+# The first ten rows of this project, in display order.
+cs_compute_jump_slots() {
+  JUMP_SLOT=()
+  JUMP_TARGET=()
+  ((SHOW_INDEX)) || return 0
+  local n=${#ENTRIES_ID[@]} i slot=1
+  for ((i = 0; i < n && slot <= 10; i++)); do
+    [[ "${ENTRIES_TYPE[${i}]}" == "local" ]] || continue
+    JUMP_SLOT[${i}]=$((slot % 10))
+    JUMP_TARGET[$((slot % 10))]=${i}
+    slot=$((slot + 1))
+  done
+}
+
+cs_jump_to_session() {
+  local target="$1"
+  cs_compute_jump_slots
+  [[ -v "JUMP_TARGET[${target}]" ]] || return 0
+  SELECTED=${JUMP_TARGET[${target}]}
+  cs_activate_selected
+  cs_focus_session
+  DIRTY=1
+}
+
+# WINCH handler — re-pin picker width on terminal resize.
+cs_handle_winch() {
+  _tmux resize-pane -t "${PICKER_PANE}" -x "${PICKER_WIDTH}" 2>/dev/null
+  DIRTY=1
+  # Re-fit the displayed session's terminal: a percentage keeps its share and is
+  # squeezed when Claude would drop below its minimum; a fixed size that no
+  # longer fits is hidden, unless it was opened without room to begin with.
+  local id="${DISPLAYED}" tp orient saved over total want max
+  [[ -n "${id}" ]] || return 0
+  cs_term_is_shown "${id}" || return 0
+  cs_read_state_into tp "term/${id}"
+  cs_refresh_geom
+  cs_term_in_main "${tp}" || return 0
+  [[ -n "${PANE_W[${CLIENT_PANE}]:-}" ]] || return 0
+  cs_term_orient orient "${id}"
+  if [[ "${orient}" == "side" ]]; then
+    saved="${TERMINAL_WIDTH}"
+    if [[ "${saved}" == *% ]]; then
+      cs_read_state_into over "term/${id}.width"
+      [[ "${over}" =~ ^[0-9]+%$ ]] && saved="${over}"
+    fi
+    total=$(( PANE_W[${tp}] + PANE_W[${CLIENT_PANE}] ))
+    ((total > 0)) || return 0
+    if [[ "${saved}" == *% ]]; then
+      want=$(( (total * ${saved%\%} + 50) / 100 ))
+    else
+      want="${saved}"
+    fi
+    max=$(( total - MIN_CLAUDE_WIDTH ))
+    if (( want > max )); then
+      if [[ "${TERMINAL_WIDTH}" != *% && ! -f "${STATE_DIR}/term/${id}.keep" ]]; then
+        cs_term_autohide "${id}" "${tp}"
+        return 0
+      fi
+      want="${max}"
+    else
+      rm -f "${STATE_DIR}/term/${id}.keep"
+    fi
+    (( want < 10 )) && want=10
+    _tmux resize-pane -t "${tp}" -x "${want}" 2>/dev/null || true
+  else
+    saved="${TERMINAL_HEIGHT}"
+    if [[ "${saved}" == *% ]]; then
+      cs_read_state_into over "term/${id}.height"
+      [[ "${over}" =~ ^[0-9]+%$ ]] && saved="${over}"
+    fi
+    total=$(( PANE_H[${tp}] + PANE_H[${CLIENT_PANE}] ))
+    ((total > 0)) || return 0
+    if [[ "${saved}" == *% ]]; then
+      want=$(( (total * ${saved%\%} + 50) / 100 ))
+    else
+      want="${saved}"
+    fi
+    max=$(( total - MIN_CLAUDE_HEIGHT ))
+    if (( want > max )); then
+      if [[ "${TERMINAL_HEIGHT}" != *% && ! -f "${STATE_DIR}/term/${id}.keep" ]]; then
+        cs_term_autohide "${id}" "${tp}"
+        return 0
+      fi
+      want="${max}"
+    else
+      rm -f "${STATE_DIR}/term/${id}.keep"
+    fi
+    (( want < 3 )) && want=3
+    _tmux resize-pane -t "${tp}" -y "${want}" 2>/dev/null || true
+  fi
+}
+
+# ── Actions ───────────────────────────────────────
+# Remove the last session created here if it never got a prompt and is not $1.
+# `claude rm` stops work without asking, so the decision is made on a fresh list
+# right before the call: still waiting for its first prompt, and no transcript.
+cs_cleanup_new_session() {
+  local keep="${1:-}" nid
+  cs_read_state_into nid new_session
+  [[ -n "${nid}" ]] || return 0
+  [[ "${nid}" == "${keep}" ]] && return 0
+  rm -f "${STATE_DIR}/new_session"
+  [[ "${nid}" =~ ${ID_RE} ]] || return 0
+  cs_poll 1 || return 0
+  [[ "${AG_STATE[${nid}]:-}" == "blocked" && "${AG_STATUS[${nid}]:-}" == "idle" ]] || return 0
+  [[ -z "${AG_TPATH[${nid}]:-}" ]] || return 0
+  cs_claude rm "${nid}" > /dev/null 2>&1 || true
+  cs_poll 1 || true
+}
+
+# Start a background session in this project, wait until Claude lists it, and
+# show it. It starts with no prompt: the user types the first one in the session.
+cs_new_session() {
+  cs_cleanup_new_session ""
+  local before=" ${AG_IDS[*]} "
+  local out rc=0
+  out=$(cd "${PWD}" && cs_claude --bg 2>&1) || rc=$?
+  local first="${out%%$'\n'*}"
+  if ((rc != 0)); then
+    FOOTER_MSG="${first:-claude --bg failed}"
+    # `claude --bg` has no terminal here and cannot ask. Agent view can: it shows
+    # Claude's trust dialog for a directory that was never opened before.
+    if [[ "${out,,}" == *"not trusted"* ]]; then
+      cs_open_agents
+    fi
+    return 1
+  fi
+  # "backgrounded · <id> (...)"
+  local id="" cand
+  if [[ "${first}" =~ ^backgrounded[^0-9a-f]+([0-9a-f]{8})($|[^0-9a-f]) ]]; then
+    id="${BASH_REMATCH[1]}"
+  fi
+  local deadline=$((SECONDS + 5))
+  while ((SECONDS <= deadline)); do
+    cs_poll 1 || true
+    if [[ -z "${id}" ]]; then
+      # no id in the output: the entry for this project that was not there before
+      for cand in "${AG_IDS[@]}"; do
+        [[ "${before}" == *" ${cand} "* ]] && continue
+        [[ "${AG_CWD[${cand}]%%/.claude/worktrees/*}" == "${PWD}" ]] || continue
+        id="${cand}"
+        break
+      done
+    fi
+    [[ -n "${id}" && -v "AG_STATE[${id}]" ]] && break
+    sleep "${CS_NEW_WAIT_STEP:-0.2}"
+  done
+  if [[ -z "${id}" || ! -v "AG_STATE[${id}]" ]]; then
+    FOOTER_MSG="the new session did not appear in the list"
+    return 1
+  fi
+  echo "${id}" > "${STATE_DIR}/new_session"
+  cs_rescan
+  cs_show_session "${id}"
+}
+
+# A prefix key pressed from another pane means the session being looked at, not
+# whatever row the cursor was left on. With nothing shown the cursor stays put.
+cs_cursor_to_shown() {
+  [[ -n "${SHOWN}" ]] || return 1
+  local idx
+  cs_find_entry_index "${SHOWN}" idx
+  [[ "${idx}" != "-1" ]] || return 1
+  SELECTED=${idx}
+}
+
+# Stop or remove, asked for with a prefix key. The list is drawn again before the
+# question, so the row being asked about is the one highlighted.
+cs_prefix_end() {
+  local _pf
+  _pf=$(_tmux display-message -t "${PICKER_PANE}" -p '#{pane_active}' 2>/dev/null || echo "1")
+  if [[ "${_pf}" != "1" ]]; then
+    cs_cursor_to_shown || true
+  fi
+  _tmux select-pane -t "${PICKER_PANE}" 2>/dev/null || true
+  cs_picker_render
+  cs_confirm_end "$@"
+}
+
+# Run `claude stop` or `claude rm` on the selected session after a confirmation.
+# The command's own line goes to the footer: an idle session's row does not
+# change when it is stopped, and `claude rm` can refuse.
+cs_confirm_end() {
+  local verb="$1" prompt="$2"
+  local n=${#ENTRIES_ID[@]}
+  ((n == 0)) && return 0
+  [[ "${ENTRIES_TYPE[${SELECTED}]}" == "local" ]] || return 0
+  local id="${ENTRIES_ID[${SELECTED}]}"
+  [[ "${id}" =~ ${ID_RE} ]] || return 0
+  cs_confirm "${CS_CLR_PROMPT_WARN}" "${prompt}" || return 0
+  if [[ "${id}" == "${SHOWN}" || "${id}" == "${DISPLAYED}" ]]; then
+    # welcome first, so the dying client's message is not left on screen
+    cs_show_welcome
+    _tmux select-pane -t "${PICKER_PANE}" 2>/dev/null || true
+  fi
+  local out
+  out=$(cs_claude "${verb}" "${id}" 2>&1) || true
+  FOOTER_MSG="${out%%$'\n'*}"
+  if cs_poll 1; then
+    # Removed for good: its terminal goes with it. A stopped session is still
+    # listed and keeps its terminal.
+    [[ -v "AG_STATE[${id}]" ]] || cs_term_kill "${id}"
+  fi
+  cs_rescan
+}
+
+# ── Rendering ─────────────────────────────────────
+cs_render_header_bar() {
+  local color="$1" text="$2" width="$3"
+  printf '\e[1;1H%b%*s\e[0m' "${color}" "${width}" ""
+  printf '\e[1;1H%b%s\e[0m' "${color}" "${text}"
+}
+
+cs_render_header() {
+  local width="$1"
+  local pname="${PROJECT_NAMES[${PWD_SANITIZED}]:-}"
+  local title_path
+  if [[ -n "${pname}" ]]; then
+    title_path="${pname}"
+  else
+    local dname="${DISPLAY_NAMES[${PWD}]:-}"
+    local leaf="${PWD##*/}"
+    if [[ -n "${dname}" && "${dname}" != "${leaf}" ]]; then
+      title_path="${dname}"
+    else
+      title_path="${PWD/#${HOME}/\~$(whoami)}"
+    fi
+  fi
+  local max_title=$((width - 2))
+  if ((${#title_path} > max_title)); then
+    title_path="...${title_path: -$((max_title - 3))}"
+  fi
+  local title=" ${title_path} "
+  local pad=$(( (width - ${#title}) / 2 ))
+  ((pad < 0)) && pad=0
+  printf '\e[1;1H%b%*s\e[0m' "${CS_CLR_HEADER_BG}" "${width}" ""
+  printf '\e[1;%dH%b%s\e[0m' "$((pad + 1))" "${CS_CLR_HEADER_BG}" "${title}"
+}
+
+cs_print_centered() {
+  local line="$1" text="$2" w="$3" color="${4-${CS_CLR_CHROME}}"
+  local pad=$(( (w - ${#text}) / 2 ))
+  ((pad < 0)) && pad=0
+  printf '\e[%d;1H\e[K%b%*s%s\e[0m' "${line}" "${color}" "${pad}" "" "${text}"
+}
+
+# A note is a failing poll or the last command's own line (`stopped <id>`,
+# `kept <id> …`). Draw $3 centered on the row after $1, cut to the width $2,
+# with an empty row above and below. Draws nothing and fails when $3 is empty.
+cs_render_note() {
+  local row="$1" width="$2" text="$3"
+  [[ -n "${text}" ]] || return 1
+  printf '\e[%d;1H\e[K\e[%d;1H\e[K' "${row}" "$((row + 2))"
+  cs_print_centered "$((row + 1))" "${text:0:width}" "${width}" "${CS_CLR_BELL}"
+}
+
+# How a session's row looks. Sets the variable named $1 to one of:
+#   active   the session the client pane shows
+#   bell     needs input, or finished and not looked at since
+#   dormant  no process: stopped, failed, or idle and put to sleep by Claude
+#   running  everything else
+# Stopping an idle session leaves its state `done`; only its process goes away,
+# so the process is what tells a closed session from an open one.
+cs_row_look() {
+  local _out="$1" id="$2" status="$3" _look="running"
+  if [[ -n "${SHOWN}" && "${id}" == "${SHOWN}" ]]; then
+    _look="active"
+  elif [[ "${status}" == "blocked" ]] || [[ -v "UNSEEN_SET[${id}]" ]]; then
+    _look="bell"
+  elif [[ "${status}" != "working" && -z "${AG_STATUS[${id}]:-}" ]]; then
+    _look="dormant"
+  fi
+  printf -v "${_out}" '%s' "${_look}"
+}
+
+# ── Picker TUI ────────────────────────────────────
+cs_menu_render() {
+  local width="$1" height="$2"
+
+  printf '\e[?25l\e[H'
+  cs_render_header_bar "${CS_CLR_HEADER_BG}" "Esc: cancel" "${width}"
+
+  # Blank + highlighted session entry
+  local row=2
+  printf '\e[%d;1H\e[K' "${row}"
+  ((row++))
+  if ((SELECTED >= 0 && SELECTED < ${#ENTRIES_ID[@]})); then
+    local name="${ENTRIES_NAME[${SELECTED}]}"
+    local status="${ENTRIES_STATUS[${SELECTED}]}"
+    local color='\e[0m'
+    [[ "${status}" == "blocked" ]] && color="${CS_CLR_BELL_MENU}"
+    printf '\e[%d;1H\e[K%b  %-*.*s\e[0m' "${row}" "${color}" "$((width - 2))" "$((width - 2))" "${name}"
+  else
+    printf '\e[%d;1H\e[K' "${row}"
+  fi
+
+  # Blank + menu entries
+  ((row++))
+  printf '\e[%d;1H\e[K' "${row}"
+  local i
+  for ((i = 0; i < ${#MENU_KEYS[@]}; i++)); do
+    ((row++))
+    if [[ -z "${MENU_KEYS[${i}]}" ]]; then
+      printf '\e[%d;1H\e[K' "${row}"
+    else
+      printf '\e[%d;1H\e[K  %b%s\e[0m  %b%s\e[0m' "${row}" "${CS_CLR_BOLD}" "${MENU_KEYS[${i}]}" "${CS_CLR_CHROME}" "${MENU_LABELS[${i}]}"
+    fi
+  done
+
+  # Clear remaining lines
+  ((row++))
+  printf '\e[%d;1H\e[J' "${row}"
+
+}
+
+cs_picker_render() {
+  printf -v NOW '%(%s)T' -1
+  local width height avail
+  width=$(tput cols)
+  height=$(tput lines)
+
+  if ((MENU_ACTIVE)); then
+    cs_menu_render "${width}" "${height}"
+    return
+  fi
+
+  # The search view has no footer to show a note in.
+  local note=""
+  ((SEARCH_ACTIVE)) || note="${POLL_ERROR:-${FOOTER_MSG}}"
+
+  avail=$((height - 5))
+  # A note takes three rows under the key hints, and the footer has one empty
+  # row to give. A list that fills the pane gives up the other two.
+  [[ -n "${note}" ]] && avail=$((avail - 2))
+  ((avail < 1)) && avail=1
+
+  local n=${#ENTRIES_ID[@]}
+
+  # Adjust scroll
+  if ((SELECTED < SCROLL)); then
+    SCROLL=${SELECTED}
+  elif ((SELECTED >= SCROLL + avail)); then
+    SCROLL=$((SELECTED - avail + 1))
+  fi
+
+  # Hide cursor, home position (no full clear — paint over to avoid flash)
+  printf '\e[?25l\e]112\a\e[H'
+
+  # Header (or search bar when searching)
+  if ((SEARCH_ACTIVE)); then
+    local search_clr="${CS_CLR_SEARCH_BAR}"
+    ((!SEARCH_FIELD_FOCUSED)) && search_clr="${CS_CLR_HEADER_BG}"
+    cs_render_header_bar "${search_clr}" "/${SEARCH_TERM}" "${width}"
+  else
+    cs_render_header "${width}"
+  fi
+
+  if ((n == 0)); then
+    local empty_msg="No sessions. :c starts one"
+    # a failing poll must never look like an empty list
+    [[ -n "${POLL_ERROR}" ]] && empty_msg="${POLL_ERROR}"
+    ((SEARCH_ACTIVE)) && empty_msg="No matches."
+    printf '\e[2;1H\e[K%b  %.*s\e[0m' "${CS_CLR_CHROME}" "$((width - 2))" "${empty_msg}"
+    # Clear remaining lines
+    local cl
+    for ((cl = 3; cl < height; cl++)); do
+      printf '\e[%d;1H\e[K' "${cl}"
+    done
+    # The last command's own line. With no list there is no footer to show it
+    # in, and a failing poll already has the row above.
+    cs_render_note 3 "${width}" "${FOOTER_MSG}" || true
+    if ((SEARCH_ACTIVE)); then
+      printf '\e[%d;1H\e[K' "${height}"
+      if ((SEARCH_FIELD_FOCUSED)); then
+        printf '\e]12;#ffffff\a\e[1;%dH\e[?25h' "$((2 + ${#SEARCH_TERM}))"
+      fi
+    else
+      printf '\e[%d;1H\e[K' "${height}"
+    fi
+    return
+  fi
+
+  # Session list
+  local max_name=$((width - 4))
+  ((max_name < 5)) && max_name=5
+
+  local picker_focused
+  picker_focused=$(_tmux display-message -t "${PICKER_PANE}" -p '#{pane_active}' 2>/dev/null || echo "1")
+
+  cs_compute_jump_slots
+  local i
+  for ((i = SCROLL; i < SCROLL + avail && i < n; i++)); do
+    local line=$((i - SCROLL + 2))
+    printf '\e[%d;1H\e[K' "${line}"
+
+    local name="${ENTRIES_NAME[${i}]}"
+    local status="${ENTRIES_STATUS[${i}]}"
+    local id="${ENTRIES_ID[${i}]}"
+    local entry_type="${ENTRIES_TYPE[${i}]}"
+    # The age is the last activity read from the transcript. A working session
+    # shows a marker instead, and one with no transcript yet shows nothing.
+    local age=""
+    if [[ "${status}" == "working" ]]; then
+      age="…"
+    elif [[ -n "${AG_ACT[${id}]:-}" ]]; then
+      cs_format_age "${ENTRIES_MTIME[${i}]}" age
+      ((ENTRIES_MTIME[i] >= RECENT_CUTOFF)) && age="<${RECENT_THRESHOLD}m"
+    fi
+    # pad by characters here: printf pads by bytes, and the marker is multibyte
+    local age_pad=""
+    ((${#age} < 4)) && printf -v age_pad '%*s' "$((4 - ${#age}))" ""
+    age="${age_pad}${age}"
+
+    # Header/spacer entries render separately
+    if [[ "${entry_type}" == "spacer" ]]; then
+      continue
+    fi
+    if [[ "${entry_type}" == "header" ]]; then
+      local hdr="─ ${name} ─"
+      local hpad=$(( (width - ${#hdr}) / 2 ))
+      ((hpad < 0)) && hpad=0
+      printf '%*s%b%s\e[0m' "${hpad}" "" "${CS_CLR_SECTION}" "${hdr}"
+      continue
+    fi
+
+    # Per-type: indent, color, show_age, prefix, index
+    local indent=0 line_color="${CS_CLR_DORMANT}" show_age=1 line_prefix="" idx_prefix="" look=""
+    case "${entry_type}" in
+      local|remote)
+        cs_row_look look "${id}" "${status}"
+        case "${look}" in
+          active) line_color="${CS_CLR_ACTIVE}" ;;
+          bell) line_color="${CS_CLR_BELL}" ;;
+          dormant) line_color="${CS_CLR_DORMANT}" ;;
+          *) line_color="${CS_CLR_RUNNING}" ;;
+        esac
+        if [[ "${look}" == "active" && "${picker_focused}" == "0" ]]; then
+          if [[ "${PICKER_SIDE}" == "left" ]]; then
+            line_prefix="> "
+          else
+            line_prefix="< "
+          fi
+        fi
+        if [[ "${entry_type}" == "remote" ]]; then
+          # another project's session: indented under its project, no jump number
+          [[ -n "${line_prefix}" ]] || indent=2
+        elif ((SHOW_INDEX)); then
+          if [[ -v "JUMP_SLOT[${i}]" ]]; then
+            if [[ -z "${line_prefix}" ]]; then
+              idx_prefix="${JUMP_SLOT[${i}]} "
+            fi
+          elif [[ -z "${line_prefix}" ]]; then
+            idx_prefix="  "
+          fi
+        fi
+        ;;
+      project)
+        line_color="${CS_CLR_RUNNING}" ; show_age=0
+        ;;
+    esac
+
+    # Compute available name width
+    local name_width=$((max_name - indent - ${#idx_prefix} - ${#line_prefix}))
+    if ((! show_age)); then
+      name_width=$((name_width + 4))
+    fi
+
+    # Truncate name
+    if [[ "${entry_type}" == "project" ]]; then
+      name_width=$((name_width - 2))
+      if ((${#name} > name_width)); then
+        name="...${name: -$((name_width - 3))}"
+      fi
+    elif ((${#name} > name_width)); then
+      name="${name:0:$((name_width - 3))}..."
+    fi
+
+    # Indent string
+    local indent_str=""
+    ((indent > 0)) && printf -v indent_str '%*s' "${indent}" ""
+
+    # Selection background (skip for focused or search field focused)
+    local sel_bg=""
+    if ((i == SELECTED)) && ((!SEARCH_FIELD_FOCUSED)) && [[ "${picker_focused}" == "1" ]]; then
+      sel_bg="${CS_CLR_SELECTION}"
+      printf '%b' "${sel_bg}"
+    fi
+
+    # Render line — bold line_color when selected
+    if [[ -n "${sel_bg}" ]]; then
+      line_color='\e[1m'"${line_color}"
+    fi
+    local idx_color="${CS_CLR_CHROME}"
+    [[ -n "${sel_bg}" ]] && idx_color="${line_color}"
+    if ((show_age)); then
+      printf '%s%b%s\e[0m%b%b%s%-*.*s%4s' "${indent_str}" "${idx_color}" "${idx_prefix}" "${sel_bg}" "${line_color}" "${line_prefix}" "${name_width}" "${name_width}" "${name}" "${age}"
+    else
+      printf '%s%b%s\e[0m%b%b%s%-*.*s' "${indent_str}" "${idx_color}" "${idx_prefix}" "${sel_bg}" "${line_color}" "${line_prefix}" "${name_width}" "${name_width}" "${name}"
+    fi
+    printf '\e[0m'
+  done
+
+  # Footer below session list
+  local last_entry_line
+  if ((n > SCROLL + avail)); then
+    last_entry_line=$((avail + 1))
+  else
+    last_entry_line=$((n - SCROLL + 1))
+  fi
+
+  # Scroll indicator
+  if ((n > avail)); then
+    local pct=$(( (SCROLL * 100) / (n - avail) ))
+    printf '\e[%d;1H\e[K%b%d%%\e[0m' "$((last_entry_line + 1))" "${CS_CLR_CHROME}" "${pct}"
+  else
+    printf '\e[%d;1H\e[K' "$((last_entry_line + 1))"
+  fi
+
+  if ((SEARCH_ACTIVE)); then
+    # Clear from after scroll indicator to bottom (search field is in header)
+    local cl
+    for ((cl = last_entry_line + 2; cl <= height; cl++)); do
+      printf '\e[%d;1H\e[K' "${cl}"
+    done
+    if ((SEARCH_FIELD_FOCUSED)); then
+      printf '\e]12;#ffffff\a\e[1;%dH\e[?25h' "$((2 + ${#SEARCH_TERM}))"
+    fi
+  else
+    # Centered footer (context-sensitive)
+    local footer_line=$((last_entry_line + 2))
+    local selected_type="${ENTRIES_TYPE[${SELECTED}]:-local}"
+    if [[ "${selected_type}" == "remote" || "${selected_type}" == "project" ]]; then
+      cs_print_centered "${footer_line}" "Enter:switch" "${width}"
+    else
+      cs_print_centered "${footer_line}" ": menu  / search" "${width}"
+    fi
+
+    # Quit row
+    local quit_line=$((footer_line + 1))
+    cs_print_centered "${quit_line}" "Q:detach  ?:help" "${width}"
+
+    # One empty row, then the version. A note goes between them, with an empty
+    # row of its own on either side.
+    local version_line=$((quit_line + 2))
+    if cs_render_note "$((quit_line + 1))" "${width}" "${note}"; then
+      version_line=$((quit_line + 4))
+    else
+      printf '\e[%d;1H\e[K' "$((quit_line + 1))"
+    fi
+    cs_print_centered "${version_line}" "claude-agents v${VERSION}" "${width}"
+
+    # Clear everything below
+    printf '\e[%d;1H\e[J' "$((version_line + 1))"
+  fi
+}
+
+# Put the cursor on the shown session after something changed what is shown.
+cs_select_shown() {
+  cs_rescan
+  cs_sync_highlight_local
+}
+
+cs_picker_loop() {
+  SELECTED=0
+  SCROLL=0
+  DIRTY=1
+  LAST_FINGERPRINT=""
+  WINDOW_FOCUSED=1
+
+  PICKER_PANE=$(_tmux display-message -p '#{pane_id}')
+  WINCH_PENDING=0
+  trap 'WINCH_PENDING=1' WINCH
+  cs_rename_pane_window "${PICKER_PANE}" "ca:picker"
+  echo "${PICKER_PANE}" > "${STATE_DIR}/picker_pane"
+  echo $$ > "${STATE_DIR}/picker_pid"
+
+  mkdir -p "${SEEN_DIR}" "${STATE_DIR}/term"
+  cs_load_project_names
+  cs_compute_display_names
+  _tmux rename-session "${PROJECT_NAMES[${PWD_SANITIZED}]:-${DISPLAY_NAMES[${PWD}]:-${PWD##*/}}}" 2>/dev/null || true
+  # Following reads the client pane's title. The user's tmux.conf is sourced and
+  # may have turned this off.
+  _tmux set -gw allow-set-title on 2>/dev/null || true
+
+  cs_install_keybindings
+  cs_install_focus_hook
+
+  stty -echo discard undef lnext undef 2>/dev/null || true
+  stty dsusp undef 2>/dev/null || true
+  trap 'stty echo 2>/dev/null; printf "\e[?25h\e[0m"; cs_remove_focus_hook; cs_remove_keybindings' EXIT
+
+  cs_client_write_scripts
+  cs_read_state_into DISPLAYED displayed
+  cs_read_state_into CLIENT_PANE client_pane
+  cs_refresh_pane_cache
+  if [[ -z "${CLIENT_PANE}" ]] || ! cs_pane_alive "${CLIENT_PANE}"; then
+    cs_client_ensure
+    cs_refresh_pane_cache
+  fi
+  cs_shown_at_startup
+  # Terminals whose shell exited while nobody was looking, and slots a failed
+  # switch left behind
+  cs_term_reconcile
+  cs_slot_sweep
+  cs_poll 1 || true
+  cs_follow
+  cs_rescan
+  cs_sync_highlight_local
+  cs_consume_pending_load
+  # Nothing shown: give the picker the focus so the user can navigate at once
+  [[ -n "${SHOWN}" ]] || _tmux select-pane -t "${PICKER_PANE}"
+
+  cs_picker_render
+
+  while true; do
+    local key=""
+    if IFS= read -rsn1 -t 1 key; then
+      FOOTER_MSG=""
+      if ((MENU_ACTIVE)); then
+        case "${key}" in
+          $'\e')
+            read -rsn2 -t 0.1 _ || true
+            MENU_ACTIVE=0; DIRTY=1 ;;
+          p) MENU_ACTIVE=0; cs_rename_project; DIRTY=1 ;;
+          x) MENU_ACTIVE=0; cs_confirm_end stop "Stop? y/N"; DIRTY=1 ;;
+          D) MENU_ACTIVE=0; cs_confirm_end rm "Remove (stops work)? y/N"; DIRTY=1 ;;
+          c) MENU_ACTIVE=0; cs_new_session && cs_focus_session; cs_select_shown; DIRTY=1 ;;
+          v) MENU_ACTIVE=0; cs_open_agents; DIRTY=1 ;;
+          d) MENU_ACTIVE=0; _tmux detach-client ;;
+          s) MENU_ACTIVE=0; cs_confirm_shutdown; DIRTY=1 ;;
+          *) MENU_ACTIVE=0; DIRTY=1 ;;
+        esac
+      elif ((SEARCH_ACTIVE)); then
+        if ((SEARCH_FIELD_FOCUSED)); then
+          cs_search_handle_key "${key}"
+        else
+          # In search results — limited keyset
+          case "${key}" in
+            j) cs_search_move_down; DIRTY=1 ;;
+            k) cs_search_move_up; DIRTY=1 ;;
+            J) cs_search_move_down
+               if [[ "${ENTRIES_TYPE[${SELECTED}]}" == "local" ]]; then
+                 cs_activate_selected; cs_focus_session
+               fi
+               DIRTY=1 ;;
+            K) cs_search_move_up
+               if [[ "${ENTRIES_TYPE[${SELECTED}]}" == "local" ]]; then
+                 cs_activate_selected; cs_focus_session
+               fi
+               DIRTY=1 ;;
+            $'\e')
+              local seq=""
+              read -rsn2 -t 0.1 seq || true
+              case "${seq}" in
+                '[A') cs_search_move_up; DIRTY=1 ;;
+                '[B') cs_search_move_down; DIRTY=1 ;;
+                '[C') cs_search_exit; _tmux select-pane -R 2>/dev/null || true; DIRTY=1 ;;
+                '[D') cs_search_exit; _tmux select-pane -L 2>/dev/null || true; DIRTY=1 ;;
+                '') cs_search_exit; DIRTY=1 ;;
+              esac
+              ;;
+            '')
+              cs_search_exit
+              cs_activate_selected
+              cs_focus_session
+              DIRTY=1
+              ;;
+          esac
+        fi
+      else
+        case "${key}" in
+          j) cs_move_down; DIRTY=1 ;;
+          k) cs_move_up; DIRTY=1 ;;
+          J) local _pf; _pf=$(_tmux display-message -t "${PICKER_PANE}" -p '#{pane_active}' 2>/dev/null || echo "1")
+             [[ "${_pf}" == "0" ]] && cs_sync_highlight_local
+             cs_move_down 1
+             cs_activate_selected; cs_focus_session
+             DIRTY=1 ;;
+          K) local _pf; _pf=$(_tmux display-message -t "${PICKER_PANE}" -p '#{pane_active}' 2>/dev/null || echo "1")
+             [[ "${_pf}" == "0" ]] && cs_sync_highlight_local
+             cs_move_up 1
+             cs_activate_selected; cs_focus_session
+             DIRTY=1 ;;
+          H|L) cs_activate_selected; cs_focus_session; DIRTY=1 ;;
+          h) _tmux select-pane -L 2>/dev/null || true; DIRTY=1 ;;
+          l) _tmux select-pane -R 2>/dev/null || true; DIRTY=1 ;;
+          $'\e')
+            local seq=""
+            read -rsn2 -t 0.1 seq || true
+            case "${seq}" in
+              '[A') cs_move_up; DIRTY=1 ;;
+              '[B') cs_move_down; DIRTY=1 ;;
+              '[C') _tmux select-pane -R 2>/dev/null || true; DIRTY=1 ;;
+              '[D') _tmux select-pane -L 2>/dev/null || true; DIRTY=1 ;;
+            esac
+            ;;
+          '')
+            cs_activate_selected
+            cs_focus_session
+            DIRTY=1
+            ;;
+          ' ') cs_activate_selected; DIRTY=1 ;;
+          a|i) cs_focus_session; DIRTY=1 ;;
+          /) cs_search_enter; DIRTY=1 ;;
+          ':') cs_menu_enter ;;
+          '?') cs_show_welcome; DIRTY=1 ;;
+          Q) _tmux detach-client ;;
+          '~') cs_term_toggle; DIRTY=1 ;;
+          '`') cs_term_smart; DIRTY=1 ;;
+          $'\t') cs_term_smart side; DIRTY=1 ;;
+          '_') cs_term_smart bottom; DIRTY=1 ;;
+          '|') cs_focus_session; DIRTY=1 ;;
+          $'\x01') _tmux select-pane -t "${PICKER_PANE}"; cs_search_enter; DIRTY=1 ;;
+          $'\x19') _tmux select-pane -t "${PICKER_PANE}"; cs_rename_project; DIRTY=1 ;;
+          $'\x16') _tmux select-pane -t "${PICKER_PANE}"; cs_confirm_shutdown; DIRTY=1 ;;
+          $'\x02') _tmux select-pane -t "${PICKER_PANE}"; cs_new_session && cs_focus_session; cs_select_shown; DIRTY=1 ;;
+          $'\x05') _tmux select-pane -t "${PICKER_PANE}"; cs_menu_enter ;;
+          $'\x06') cs_prefix_end stop "Stop? y/N"; DIRTY=1 ;;
+          $'\x14') cs_prefix_end rm "Remove (stops work)? y/N"; DIRTY=1 ;;
+          $'\x10') cs_open_agents; DIRTY=1 ;;
+          $'\x0e')
+            _tmux select-pane -t "${PICKER_PANE}"
+            stty echo 2>/dev/null || true
+            printf '\e[?25h\e[0m'
+            CS_PICKER=1 CS_STATE_DIR="${STATE_DIR}" exec "${SCRIPT_PATH}" ;;
+          $'\x0f')
+            local _pf
+            _pf=$(_tmux display-message -p '#{pane_id}' 2>/dev/null || true)
+            if [[ "${_pf}" == "${PICKER_PANE}" ]]; then
+              cs_focus_session
+            else
+              _tmux select-pane -t "${PICKER_PANE}"
+            fi
+            DIRTY=1
+            ;;
+          [0-9]) cs_jump_to_session "${key}" ;;
+          $'\x12') cs_poll 1 || true; cs_rescan; DIRTY=1 ;;
+          R)
+            stty echo 2>/dev/null || true
+            printf '\e[?25h\e[0m'
+            CS_PICKER=1 CS_STATE_DIR="${STATE_DIR}" exec "${SCRIPT_PATH}"
+            ;;
+        esac
+      fi
+    else
+      # Close menu if picker lost focus
+      if ((MENU_ACTIVE)); then
+        local _pf
+        _pf=$(_tmux display-message -t "${PICKER_PANE}" -p '#{pane_active}' 2>/dev/null || echo "1")
+        if [[ "${_pf}" != "1" ]]; then
+          MENU_ACTIVE=0
+          DIRTY=1
+        fi
+      fi
+      # Timeout — window focus, then one scan
+      if [[ -f "${STATE_DIR}/focus_in" ]]; then
+        rm -f "${STATE_DIR}/focus_in"
+        WINDOW_FOCUSED=1
+      fi
+      if [[ -f "${STATE_DIR}/focus_out" ]]; then
+        rm -f "${STATE_DIR}/focus_out"
+        WINDOW_FOCUSED=0
+      fi
+      cs_tick
+      cs_consume_pending_load
+      if ((MENU_ACTIVE)) && [[ "${ENTRIES_ID[${SELECTED}]:-}" != "${MENU_TARGET_ID}" ]]; then
+        MENU_ACTIVE=0; DIRTY=1
+      fi
+      # PICKER_ACTIVE is from cs_tick above: nothing between it and here may change focus
+      local fp
+      cs_fingerprint fp "${PICKER_ACTIVE}"
+      if [[ "${fp}" != "${LAST_FINGERPRINT}" ]]; then
+        LAST_FINGERPRINT="${fp}"
+        DIRTY=1
+      fi
+    fi
+    if ((WINCH_PENDING)); then
+      WINCH_PENDING=0
+      cs_handle_winch
+    fi
+    if ((DIRTY)); then
+      cs_picker_render
+      DIRTY=0
+      cs_fingerprint LAST_FINGERPRINT
+    fi
+  done
+}
+
+cs_move_down() {
+  local n=${#ENTRIES_ID[@]} local_only=${1:-0}
+  ((n == 0)) && return 0
+  local start=${SELECTED}
+  SELECTED=$(( (SELECTED + 1) % n ))
+  if ((local_only)); then
+    while [[ "${ENTRIES_TYPE[${SELECTED}]}" != "local" ]] && ((SELECTED != start)); do
+      SELECTED=$(( (SELECTED + 1) % n ))
+    done
+  else
+    while [[ "${ENTRIES_TYPE[${SELECTED}]}" == "header" || "${ENTRIES_TYPE[${SELECTED}]}" == "spacer" ]] && ((SELECTED != start)); do
+      SELECTED=$(( (SELECTED + 1) % n ))
+    done
+  fi
+}
+
+cs_move_up() {
+  local n=${#ENTRIES_ID[@]} local_only=${1:-0}
+  ((n == 0)) && return 0
+  local start=${SELECTED}
+  SELECTED=$(( (SELECTED - 1 + n) % n ))
+  if ((local_only)); then
+    while [[ "${ENTRIES_TYPE[${SELECTED}]}" != "local" ]] && ((SELECTED != start)); do
+      SELECTED=$(( (SELECTED - 1 + n) % n ))
+    done
+  else
+    while [[ "${ENTRIES_TYPE[${SELECTED}]}" == "header" || "${ENTRIES_TYPE[${SELECTED}]}" == "spacer" ]] && ((SELECTED != start)); do
+      SELECTED=$(( (SELECTED - 1 + n) % n ))
+    done
+  fi
+}
+
+cs_del_kv() {
+  local file="$1" key="$2"
+  [[ -f "${file}" ]] || return 0
+  local tmp="${file}.tmp"
+  grep -v "^${key}=" "${file}" > "${tmp}" 2>/dev/null || true
+  mv "${tmp}" "${file}"
+}
+
+cs_set_kv() {
+  local file="$1" key="$2" value="$3"
+  local safe="${value//\\/\\\\}"
+  safe="${safe//|/\\|}"
+  safe="${safe//&/\\&}"
+  if grep -q "^${key}=" "${file}" 2>/dev/null; then
+    sed "s|^${key}=.*|${key}=${safe}|" "${file}" > "${file}.tmp" && mv "${file}.tmp" "${file}"
+  elif grep -q "^# ${key}=" "${file}" 2>/dev/null; then
+    sed "s|^# ${key}=.*|${key}=${safe}|" "${file}" > "${file}.tmp" && mv "${file}.tmp" "${file}"
+  else
+    echo "${key}=${value}" >> "${file}"
+  fi
+}
+
+# Put the cursor on the shown session, or on the first row when nothing is shown.
+cs_sync_highlight_local() {
+  local idx i
+  if [[ -n "${SHOWN}" ]]; then
+    cs_find_entry_index "${SHOWN}" idx
+    if [[ "${idx}" != "-1" ]]; then
+      SELECTED=${idx}
+      return
+    fi
+  fi
+  for ((i = 0; i < ${#ENTRIES_ID[@]}; i++)); do
+    if [[ "${ENTRIES_TYPE[${i}]}" != "header" && "${ENTRIES_TYPE[${i}]}" != "spacer" ]]; then
+      SELECTED=${i}
+      return
+    fi
+  done
+}
+
+cs_activate_selected() {
+  local n=${#ENTRIES_ID[@]}
+  ((n == 0)) && return 0
+  case "${ENTRIES_TYPE[${SELECTED}]}" in
+    local) cs_show_session "${ENTRIES_ID[${SELECTED}]}" ;;
+    project) cs_switch_to_project "${ENTRIES_PATH[${SELECTED}]}" ;;
+    remote) cs_switch_to_project "${ENTRIES_PATH[${SELECTED}]}" "${ENTRIES_ID[${SELECTED}]}" ;;
+  esac
+}
+
+# Hop to another project's view. The launcher reads switch_target once this
+# client has detached: the project path, then the session to show there, if any.
+# pending_load is not written here. The launcher writes it after it has
+# initialized the target's state, because that wipes the state dir of a server
+# that is not running, which is the normal case for another project.
+cs_switch_to_project() {
+  local target_path="$1" id="${2:-}"
+  [[ -n "${target_path}" ]] || return 0
+  printf '%s\n%s\n' "${target_path}" "${id}" > "${STATE_DIR}/switch_target"
+  _tmux detach-client 2>/dev/null || true
+}
+
+# A hop from another project's picker asked for a session to be shown here.
+cs_consume_pending_load() {
+  local pending idx
+  cs_read_state_into pending pending_load
+  [[ -n "${pending}" ]] || return 0
+  rm -f "${STATE_DIR}/pending_load"
+  [[ "${pending}" =~ ${ID_RE} ]] || return 0
+  cs_poll 1 || true
+  cs_rescan
+  cs_find_entry_index "${pending}" idx
+  [[ "${idx}" != "-1" && "${ENTRIES_TYPE[${idx}]}" == "local" ]] || return 0
+  SELECTED=${idx}
+  if cs_show_session "${pending}"; then
+    cs_focus_session
+  fi
+  DIRTY=1
+}
+
+cs_confirm() {
+  local color="$1" text="$2"
+  local width
+  width=$(tput cols)
+  cs_render_header_bar "\e[7m${color}" "${text}" "${width}"
+  local confirm=""
+  read -rsn1 confirm
+  [[ "${confirm}" == "y" ]]
+}
+
+cs_read_line() {
+  local initial="${1:-}"
+  CS_INPUT_RESULT="${initial}"
+  printf '%s' "${CS_INPUT_RESULT}"
+  while IFS= read -rsn1 ch; do
+    case "${ch}" in
+      $'\e')
+        read -rsn2 -t 0.1 _ || true
+        if [[ -z "${CS_INPUT_RESULT}" ]]; then
+          return 1
+        fi
+        local _len=${#CS_INPUT_RESULT}
+        printf '%*s' "${_len}" "" | tr ' ' $'\b'
+        printf '%*s' "${_len}" ""
+        printf '%*s' "${_len}" "" | tr ' ' $'\b'
+        CS_INPUT_RESULT=""
+        ;;
+      $'\x7f'|$'\b')
+        if ((${#CS_INPUT_RESULT} > 0)); then
+          CS_INPUT_RESULT="${CS_INPUT_RESULT%?}"
+          printf '\b \b'
+        fi
+        ;;
+      "") return 0 ;;
+      *)
+        if [[ "${ch}" == [[:print:]] ]]; then
+          CS_INPUT_RESULT+="${ch}"
+          printf '%s' "${ch}"
+        fi
+        ;;
+    esac
+  done
+  return 1
+}
+
+# Closes the view. Sessions belong to Claude's supervisor and keep running.
+cs_confirm_shutdown() {
+  # The terminals live in this server and die with it. Say so when there are any.
+  local prompt="Shutdown? y/N" f
+  for f in "${STATE_DIR}"/term/*; do
+    if [[ -f "${f}" && "${f##*/}" != *.* ]]; then
+      prompt="Shutdown, kill terminals? y/N"
+      break
+    fi
+  done
+  cs_confirm "${CS_CLR_PROMPT_DANGER}" "${prompt}" || return 0
+  stty echo 2>/dev/null || true
+  printf '\e[?25h\e[0m'
+  cs_remove_focus_hook
+  cs_remove_keybindings
+  rm -rf "${STATE_DIR}"
+  _tmux kill-server 2>/dev/null || true
+}
+
+cs_rename_project() {
+  local target_path=""
+  local entry_type="${ENTRIES_TYPE[${SELECTED}]:-}"
+  local sanitized=""
+  case "${entry_type}" in
+    local|"") target_path="${PWD}"; sanitized="${PWD_SANITIZED}" ;;
+    project|remote) target_path="${ENTRIES_PATH[${SELECTED}]}"; sanitized=$(cs_sanitize_path "${target_path}") ;;
+    *) return 0 ;;
+  esac
+  [[ -n "${target_path}" ]] || return 0
+
+  local old_name="${PROJECT_NAMES[${sanitized}]:-}"
+  local width
+  width=$(tput cols)
+  cs_render_header_bar "\e[7m${CS_CLR_PROMPT_WARN}" "Project: " "${width}"
+  printf '\e[1;10H\e[7m%b' "${CS_CLR_PROMPT_WARN}"
+  printf '\e[?25h'
+  if cs_read_line "${old_name}"; then
+    if [[ -n "${CS_INPUT_RESULT}" ]]; then
+      cs_set_kv "${PROJECT_NAMES_FILE}" "${sanitized}" "${CS_INPUT_RESULT}"
+      PROJECT_NAMES["${sanitized}"]="${CS_INPUT_RESULT}"
+    elif [[ -n "${old_name}" ]]; then
+      cs_del_kv "${PROJECT_NAMES_FILE}" "${sanitized}"
+      unset "PROJECT_NAMES[${sanitized}]"
+    fi
+    cs_rescan
+  fi
+  printf '\e[?25l\e[0m'
+}
+
+# client-focus-in/out tell the picker whether the terminal window has focus. A
+# session only counts as seen while it does.
+cs_install_focus_hook() {
+  _tmux set -s focus-events on
+  # Paths reach run-shell via tmux env vars so attacker-controlled characters
+  # in STATE_DIR cannot break out of the hook command string.
+  _tmux set-environment -g CS_FOCUS_IN "${STATE_DIR}/focus_in"
+  _tmux set-environment -g CS_FOCUS_OUT "${STATE_DIR}/focus_out"
+  _tmux set-hook -g client-focus-in 'run-shell "touch \"\$CS_FOCUS_IN\""'
+  _tmux set-hook -g client-focus-out 'run-shell "touch \"\$CS_FOCUS_OUT\""'
+}
+
+cs_remove_focus_hook() {
+  _tmux set-hook -gu client-focus-in 2>/dev/null || true
+  _tmux set-hook -gu client-focus-out 2>/dev/null || true
+  _tmux set-environment -gu CS_FOCUS_IN 2>/dev/null || true
+  _tmux set-environment -gu CS_FOCUS_OUT 2>/dev/null || true
+}
+
+cs_bind() {
+  local action="$1" defaults="$2"
+  shift 2
+  local tmux_args=("$@")
+  local keys="${BIND_OVERRIDES[bind_${action}]:-${defaults}}"
+  local key_list key
+  IFS=',' read -ra key_list <<< "${keys}"
+  for key in "${key_list[@]}"; do
+    key="${key// /}"
+    _tmux bind-key "${key}" "${tmux_args[@]}"
+  done
+}
+
+cs_install_keybindings() {
+  local user_prefix
+  user_prefix=$(_tmux show-options -gv prefix 2>/dev/null || echo "C-b")
+
+  if [[ -n "${CS_PREFIX:-}" ]]; then
+    _tmux set-option -g prefix "${CS_PREFIX}"
+    user_prefix="${CS_PREFIX}"
+  fi
+
+  # Wipe prefix table only (preserves root/mouse/copy-mode)
+  _tmux unbind-key -a -T prefix
+
+  # Re-bind send-prefix so double-prefix sends the literal key
+  _tmux bind-key "${user_prefix}" send-prefix
+
+  # Focus claude pane (reuses existing | trigger)
+  cs_bind focus_claude 'Enter,i' send-keys -t "${PICKER_PANE}" "|"
+
+  # Session navigation (sends J/K to picker = move+activate+focus)
+  cs_bind nav_next 'J,S-Down' send-keys -t "${PICKER_PANE}" "J"
+  cs_bind nav_prev 'K,S-Up' send-keys -t "${PICKER_PANE}" "K"
+
+  # Pane movement
+  cs_bind pane_left 'h,Left,S-Left' select-pane -L
+  cs_bind pane_right 'l,Right,S-Right' select-pane -R
+  cs_bind pane_up 'k,Up' select-pane -U
+  cs_bind pane_down 'j,Down' select-pane -D
+
+  # Smart focus: picker↔claude toggle
+  cs_bind focus_picker Space send-keys -t "${PICKER_PANE}" $'\x0f'
+
+  # Detach
+  cs_bind detach d detach-client
+
+  # Zoom
+  cs_bind zoom z resize-pane -Z
+
+  # Copy/paste
+  cs_bind copy_mode '[' copy-mode
+  cs_bind paste ']' paste-buffer
+
+  # Refresh/rescan (dedicated trigger)
+  cs_bind refresh + send-keys -t "${PICKER_PANE}" $'\x12'
+
+  # Command menu: focus picker + enter menu
+  cs_bind menu ':' send-keys -t "${PICKER_PANE}" $'\x05'
+
+  # tmux command prompt (escape hatch)
+  _tmux bind-key F12 command-prompt
+
+  # Search and new-session: non-printable triggers, picker handles focus-steal
+  cs_bind search / send-keys -t "${PICKER_PANE}" $'\x01'
+  cs_bind new_session c send-keys -t "${PICKER_PANE}" $'\x02'
+  cs_bind close x send-keys -t "${PICKER_PANE}" $'\x06'
+  cs_bind remove D send-keys -t "${PICKER_PANE}" $'\x14'
+  cs_bind agents v send-keys -t "${PICKER_PANE}" $'\x10'
+
+  # Terminal
+  cs_bind terminal '`' send-keys -t "${PICKER_PANE}" '`'
+  cs_bind side_terminal Tab send-keys -t "${PICKER_PANE}" $'\t'
+  cs_bind bottom_terminal q send-keys -t "${PICKER_PANE}" '_'
+  cs_bind toggle_terminal t send-keys -t "${PICKER_PANE}" "~"
+  # With the grave as prefix, prefix+grave is the terminal: this types a literal one
+  _tmux bind-key a send-keys '`'
+  cs_bind rename_project p send-keys -t "${PICKER_PANE}" $'\x19'
+  cs_bind shutdown s send-keys -t "${PICKER_PANE}" $'\x16'
+  cs_bind reload R send-keys -t "${PICKER_PANE}" $'\x0e'
+  cs_bind help '?' send-keys -t "${PICKER_PANE}" '?'
+
+  _tmux bind-key PPage copy-mode -u
+  _tmux bind-key NPage send-keys -X page-down
+  _tmux bind-key S-PPage copy-mode '\;' send-keys -X halfpage-up
+  _tmux bind-key S-NPage send-keys -X halfpage-down
+  _tmux bind-key -T copy-mode-vi S-PPage send-keys -X halfpage-up
+  _tmux bind-key -T copy-mode-vi S-NPage send-keys -X halfpage-down
+  _tmux bind-key -T copy-mode S-PPage send-keys -X halfpage-up
+  _tmux bind-key -T copy-mode S-NPage send-keys -X halfpage-down
+
+  # Resize (M-arrows ×2, C-arrows ×5)
+  _tmux bind-key -r M-Up resize-pane -U 2
+  _tmux bind-key -r M-Down resize-pane -D 2
+  _tmux bind-key -r M-Left resize-pane -L 2
+  _tmux bind-key -r M-Right resize-pane -R 2
+  _tmux bind-key -r C-Up resize-pane -U 5
+  _tmux bind-key -r C-Down resize-pane -D 5
+  _tmux bind-key -r C-Left resize-pane -L 5
+  _tmux bind-key -r C-Right resize-pane -R 5
+
+  # Jump to Nth session (1-9, 0=10th)
+  local n
+  for n in 1 2 3 4 5 6 7 8 9 0; do
+    _tmux bind-key "${n}" send-keys -t "${PICKER_PANE}" "${n}"
+  done
+}
+
+cs_remove_keybindings() {
+  _tmux unbind-key -a -T prefix 2>/dev/null || true
+}
+
+# ── Reset ─────────────────────────────────────────
+# Closes the view and clears its state. Sessions keep running.
+cs_reset() {
+  PWD_SANITIZED=$(cs_sanitize_path "${PWD}")
+  STATE_DIR="${CS_STATE_ROOT}/${PWD_SANITIZED}"
+  cs_assert_state_dir_safe
+  _tmux kill-server 2>/dev/null || true
+  rm -rf "${STATE_DIR}"
+  echo "Reset complete. Sessions keep running."
+}
+
+# ── Launcher ──────────────────────────────────────
+cs_launch() {
+  # Session a hop asked this project's picker to show
+  local pending=""
+  while true; do
+    cs_load_config
+    cs_init_state
+    # Only now can the request be left for the picker: cs_init_state has just
+    # wiped the state dir if this project's server was not running.
+    if [[ -n "${pending}" ]]; then
+      echo "${pending}" > "${STATE_DIR}/pending_load"
+      pending=""
+    fi
+
+    local session_name
+    session_name="ca$(cs_sanitize_path "${PWD}")"
+
+    # A live server built by another version can't run this picker. Say so, but never
+    # kill it from under the user just because they ran claude-agents.
+    if _tmux has-session 2>/dev/null \
+       && [[ "$(cs_read_state compat_version)" != "${CS_COMPAT_VERSION}" ]]; then
+      echo
+      echo "  claude-agents was updated, but the running view still uses the old layout —"
+      echo "  you're on the previous version until it restarts."
+      echo
+      echo "    press  prefix+R            (inside the view), or"
+      echo "    run    claude-agents --restart"
+      echo
+      echo "  Either restarts the view. Sessions keep running; open terminals close."
+      echo
+      [[ -t 0 ]] && read -rsn1 -p "  Press any key to continue... "
+      echo
+    fi
+
+    if ! _tmux has-session 2>/dev/null; then
+      # Only when a server is about to be created, not on a re-attach.
+      cs_preflight_claude || exit 1
+      _tmux new-session -d -s "${session_name}" \
+        "CS_PICKER=1 CS_STATE_DIR=${STATE_DIR@Q} exec ${SCRIPT_PATH@Q}"
+      if [[ -n "${TMUX_CONF}" && -f "${TMUX_CONF}" ]]; then
+        _tmux source-file "${TMUX_CONF}" 2>/dev/null || true
+      fi
+      _tmux set -g window-status-format ''
+      _tmux set -g window-status-current-format ''
+      _tmux set -g status-left-length 50
+      _tmux set -s focus-events on
+      _tmux set -s extended-keys on
+      _tmux set -gw allow-set-title on
+    fi
+
+    # Block until detach (NOT exec — we need control back for project switching)
+    command tmux -L "${TMUX_SERVER}" attach-session
+
+    # The picker found an incompatible server and killed it. It couldn't tell the user —
+    # it was a pane inside that server — so we do it here, where the shell has the
+    # terminal back and the message survives in scrollback.
+    if [[ -f "${STATE_DIR}/restart_required" ]]; then
+      rm -f "${STATE_DIR}/restart_required"
+      echo "claude-agents was updated and the layout changed, so the view was closed."
+      echo "Run claude-agents again — your sessions kept running."
+      break
+    fi
+
+    # A hop: the picker left the project to switch to, and maybe a session.
+    if [[ -f "${STATE_DIR}/switch_target" ]]; then
+      local target_path="" target_id=""
+      {
+        IFS= read -r target_path
+        IFS= read -r target_id
+      } < "${STATE_DIR}/switch_target"
+      rm -f "${STATE_DIR}/switch_target"
+      if [[ -d "${target_path}" ]]; then
+        cd "${target_path}" || break
+        cs_normalize_pwd
+        TMUX_SERVER=$(cs_server_name "$PWD")
+        [[ "${target_id}" =~ ${ID_RE} ]] && pending="${target_id}"
+        continue
+      fi
+    fi
+    break  # normal detach
+  done
+}
+
+# ── Entrypoint ────────────────────────────────────
+cs_preflight
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  echo "claude-agents v${VERSION} — tmux picker for Claude Code background sessions"
+  echo ""
+  echo "Usage:"
+  echo "  claude-agents            Launch picker"
+  echo "  claude-agents --reset    Close the view, clear its state (sessions keep running)"
+  echo "  claude-agents --restart  Reset and relaunch"
+  echo "  claude-agents --help     Show this help"
+  echo ""
+  cs_help_text
+  echo ""
+  echo "Config: ${CONFIG_FILE}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "--reset" ]]; then
+  cs_load_config
+  cs_reset
+  exit 0
+fi
+
+if [[ "${1:-}" == "--restart" ]]; then
+  cs_load_config
+  cs_reset
+  exec "${SCRIPT_PATH}"
+fi
+
+if [[ "${CS_PICKER:-}" == "1" ]]; then
+  STATE_DIR="${CS_STATE_DIR:-}"
+  if [[ -z "${STATE_DIR}" ]]; then
+    echo "ERROR: CS_STATE_DIR not set"
+    exit 1
+  fi
+  cs_load_config
+  # Reached with new code inside an old server after `R` re-execs us. We can't run
+  # against a topology we didn't build, and we can't migrate it, so stop the server.
+  # Leave a marker for cs_launch to explain — anything printed here dies with the
+  # server. Do NOT wipe STATE_DIR, or the marker goes with it.
+  if [[ "$(cs_read_state compat_version)" != "${CS_COMPAT_VERSION}" ]]; then
+    : > "${STATE_DIR}/restart_required"
+    _tmux kill-server 2>/dev/null || true
+    exit 0
+  fi
+  cs_picker_loop
+else
+  cs_launch "$@"
+fi

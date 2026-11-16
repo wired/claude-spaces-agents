@@ -1,0 +1,854 @@
+#!/usr/bin/env bash
+# ══════════════════════════════════════════════════
+# claude-agents break runner
+#
+# A green test only proves that it can pass. Each break below damages one thing
+# in a copy of claude-agents and names the tests that must go red because of it.
+# The real files are never touched.
+#
+#   run_breaks_agents           every break, then the tests no break names
+#   run_breaks_agents <word>    only the breaks whose label or tests contain <word>
+#
+# A break:
+#
+#   @@ what is broken | test_name [test_name ...]
+#   - a line, exactly as it is in the file (one or more, contiguous)
+#   + what goes in its place (none: the lines are deleted)
+#   &&
+#   - a second place to damage in the same break (optional)
+#
+# The `-` lines must be in the file exactly once. A header ending in `| harness`
+# damages run_tests_agents instead: that is how the check that runs after every
+# test is itself seen to fail.
+#
+# When code changes, a break whose lines are gone is reported, not skipped.
+# ══════════════════════════════════════════════════
+
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
+  for _bash in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    [[ -x "$_bash" ]] && exec "$_bash" "$0" "$@"
+  done
+  echo "ERROR: bash 4.3+ required (found ${BASH_VERSION})."
+  exit 1
+fi
+
+HERE=$(dirname "$(readlink -f "$0")")
+SCRIPT=$(readlink -f "${SCRIPT_UNDER_TEST:-${HERE}/claude-agents}")
+TESTS="${HERE}/run_tests_agents"
+FILTER="${1:-}"
+
+RED='\033[31m'
+GREEN='\033[32m'
+RESET='\033[0m'
+
+WORK=$(mktemp -d)
+trap 'rm -rf "${WORK}"' EXIT
+
+B_LABEL=()
+B_TESTS=()
+B_TARGET=()
+B_HUNKS=()
+declare -A H_OLD H_NEW H_HAS_OLD H_HAS_NEW
+declare -A BASE
+REASON=""
+COPY=""
+
+load_breaks() {
+  local line n=-1 h=0 key label rest target
+  while IFS= read -r line; do
+    case "${line}" in
+      "@@ "*)
+        n=$((n + 1))
+        h=0
+        line="${line#@@ }"
+        label="${line%% | *}"
+        rest="${line#* | }"
+        target="script"
+        if [[ "${rest}" == *" | harness" ]]; then
+          target="harness"
+          rest="${rest% | harness}"
+        fi
+        B_LABEL[n]="${label}"
+        B_TESTS[n]="${rest}"
+        B_TARGET[n]="${target}"
+        B_HUNKS[n]=1
+        ;;
+      "&&")
+        h=$((h + 1))
+        B_HUNKS[n]=$((h + 1))
+        ;;
+      "- "*|"-")
+        key="${n}.${h}"
+        if [[ -v "H_HAS_OLD[${key}]" ]]; then
+          H_OLD[${key}]+=$'\n'"${line:2}"
+        else
+          H_OLD[${key}]="${line:2}"
+          H_HAS_OLD[${key}]=1
+        fi
+        ;;
+      "+ "*|"+")
+        key="${n}.${h}"
+        if [[ -v "H_HAS_NEW[${key}]" ]]; then
+          H_NEW[${key}]+=$'\n'"${line:2}"
+        else
+          H_NEW[${key}]="${line:2}"
+          H_HAS_NEW[${key}]=1
+        fi
+        ;;
+    esac
+  done
+}
+
+# apply_break <n> — write the damaged copy and set COPY, or set REASON and fail
+apply_break() {
+  local n="$1" src dst h key i j k hits at
+  if [[ "${B_TARGET[n]}" == "harness" ]]; then
+    src="${TESTS}"
+    dst="${WORK}/run_tests_agents"
+  else
+    src="${SCRIPT}"
+    dst="${WORK}/claude-agents"
+  fi
+  local -a lines old new
+  mapfile -t lines < "${src}"
+  for ((h = 0; h < B_HUNKS[n]; h++)); do
+    key="${n}.${h}"
+    if [[ ! -v "H_HAS_OLD[${key}]" ]]; then
+      REASON="place $((h + 1)) names no lines to damage"
+      return 1
+    fi
+    mapfile -t old <<< "${H_OLD[${key}]}"
+    new=()
+    if [[ -v "H_HAS_NEW[${key}]" ]]; then
+      mapfile -t new <<< "${H_NEW[${key}]}"
+    fi
+    k=${#old[@]}
+    hits=0
+    at=-1
+    for ((i = 0; i + k <= ${#lines[@]}; i++)); do
+      [[ "${lines[i]}" == "${old[0]}" ]] || continue
+      for ((j = 1; j < k; j++)); do
+        [[ "${lines[i + j]}" == "${old[j]}" ]] || continue 2
+      done
+      hits=$((hits + 1))
+      at=${i}
+    done
+    if ((hits != 1)); then
+      REASON="its lines are in ${src##*/} ${hits} times, not once (place $((h + 1)))"
+      return 1
+    fi
+    lines=("${lines[@]:0:at}" "${new[@]}" "${lines[@]:at + k}")
+  done
+  printf '%s\n' "${lines[@]}" > "${dst}"
+  chmod +x "${dst}"
+  if ! bash -n "${dst}" 2>/dev/null; then
+    REASON="the damaged copy is not valid bash"
+    return 1
+  fi
+  COPY="${dst}"
+}
+
+# run_one <script> <tests file> <test> — prints pass, fail or error
+run_one() {
+  local out
+  out=$(SCRIPT_UNDER_TEST="$1" timeout 180 "$2" "$3" 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g')
+  printf '%s\n' "${out}" > "${WORK}/last.out"
+  if [[ "${out}" == *$'\n'"1 passed, 0 failed"* ]]; then
+    echo "pass"
+  elif [[ "${out}" == *$'\n'"0 passed, 1 failed"* ]]; then
+    echo "fail"
+  else
+    echo "error"
+  fi
+}
+
+# True when test $1 is green on the undamaged files.
+baseline() {
+  if [[ ! -v "BASE[$1]" ]]; then
+    BASE[$1]=$(run_one "${SCRIPT}" "${TESTS}" "$1")
+  fi
+  [[ "${BASE[$1]}" == "pass" ]]
+}
+
+main() {
+  echo "claude-agents breaks"
+  echo "══════════════════════════════════"
+  echo "script: ${SCRIPT}"
+  echo ""
+  local n t verdict reds=0 problems=0 breaks=0
+  for ((n = 0; n < ${#B_LABEL[@]}; n++)); do
+    if [[ -n "${FILTER}" && "${B_LABEL[n]}" != *"${FILTER}"* && "${B_TESTS[n]}" != *"${FILTER}"* ]]; then
+      continue
+    fi
+    breaks=$((breaks + 1))
+    if ! apply_break "${n}"; then
+      echo -e "  ${RED}BAD BREAK${RESET}  ${B_LABEL[n]}: ${REASON}"
+      problems=$((problems + 1))
+      continue
+    fi
+    for t in ${B_TESTS[n]}; do
+      if ! baseline "${t}"; then
+        echo -e "  ${RED}NOT GREEN${RESET}  ${t} does not pass before anything is broken"
+        problems=$((problems + 1))
+        continue
+      fi
+      if [[ "${B_TARGET[n]}" == "harness" ]]; then
+        verdict=$(run_one "${SCRIPT}" "${COPY}" "${t}")
+      else
+        verdict=$(run_one "${COPY}" "${TESTS}" "${t}")
+      fi
+      case "${verdict}" in
+        fail)
+          echo -e "  ${GREEN}red${RESET}        ${B_LABEL[n]}  (${t})"
+          reds=$((reds + 1))
+          ;;
+        pass)
+          echo -e "  ${RED}STAYED GREEN${RESET}  ${B_LABEL[n]}  (${t})"
+          problems=$((problems + 1))
+          ;;
+        *)
+          echo -e "  ${RED}NO VERDICT${RESET}  ${B_LABEL[n]}  (${t}): the run did not end with one test failed"
+          tail -5 "${WORK}/last.out" | sed 's/^/      /'
+          problems=$((problems + 1))
+          ;;
+      esac
+    done
+  done
+
+  # every test has to be named by a break
+  if [[ -z "${FILTER}" ]]; then
+    local named=" ${B_TESTS[*]} "
+    while read -r t; do
+      [[ -n "${t}" ]] || continue
+      if [[ "${named}" != *" ${t} "* ]]; then
+        echo -e "  ${RED}NO BREAK${RESET}   ${t} was never seen failing"
+        problems=$((problems + 1))
+      fi
+    done < <(grep -o '^  run_test "[^"]*" *test_[a-z0-9_]*' "${TESTS}" | grep -o 'test_[a-z0-9_]*$')
+  fi
+
+  echo ""
+  echo "══════════════════════════════════"
+  echo -e "${breaks} breaks, ${reds} ${GREEN}went red${RESET}, ${problems} ${RED}problems${RESET}"
+  ((problems == 0 && breaks > 0))
+}
+
+load_breaks << 'BREAKS'
+
+# ── the list ─────────────────────────────────────
+
+@@ interactive sessions are listed | test_list_background_only
+-   if ! rows=$(jq -r '.[] | select(.kind == "background")
++   if ! rows=$(jq -r '.[] | select(.kind != "")
+
+@@ a worktree session counts as another project | test_list_this_project
+-     proj="${AG_CWD[${id}]%%/.claude/worktrees/*}"
++     proj="${AG_CWD[${id}]}"
+
+@@ ids from Claude are not checked | test_ids_validated
+-     # These end up in command lines: nothing but the expected shapes gets through.
+-     [[ "${id}" =~ ${ID_RE} ]] || continue
++     [[ -n "${id}" ]] || continue
+
+@@ control characters stay in names | test_name_control_chars_stripped
+-            ((.startedAt // 0) | tostring), ((.name // "") | gsub("[[:cntrl:]]"; " "))]
++            ((.startedAt // 0) | tostring), (.name // "")]
+
+@@ a failed poll empties the list | test_poll_failure_keeps_list
+-       [[ -n "${POLL_ERROR}" ]] || POLL_ERROR="claude agents --json failed"
++       [[ -n "${POLL_ERROR}" ]] || POLL_ERROR="claude agents --json failed"
++       AG_IDS=()
+
+@@ ended sessions sort as recent | test_order_and_names
+-       failed|stopped)
+-         older_indices+=("${i}")
++       failed|stopped)
++         recent_indices+=("${i}")
+
+@@ a promptless session is shown by its id | test_order_and_names
+-       _rf_name="(new session)"
++       _rf_name="${_rf_id}"
+
+@@ another project's sessions are listed oldest first | test_other_projects_rows
+-     cs_sort_memo order "remote:${proj}" "${lines}" -rnk1
++     cs_sort_memo order "remote:${proj}" "${lines}" -nk1
+
+@@ a custom project name is ignored in the list | test_other_projects_rows
+-     leaf="${PROJECT_NAMES[${sanitized}]:-${DISPLAY_NAMES[${proj}]:-${proj##*/}}}"
++     leaf="${DISPLAY_NAMES[${proj}]:-${proj##*/}}"
+
+@@ jump numbers go to any row | test_jump_slots
+-     [[ "${ENTRIES_TYPE[${i}]}" == "local" ]] || continue
++     [[ "${ENTRIES_TYPE[${i}]}" != "spacer" ]] || continue
+
+@@ only stopped and failed sessions are dim | test_row_look test_stop_shows_feedback
+-   elif [[ "${status}" != "working" && -z "${AG_STATUS[${id}]:-}" ]]; then
++   elif [[ "${status}" == "stopped" || "${status}" == "failed" ]]; then
+
+# ── the client pane ──────────────────────────────
+
+@@ a switch starts agent view instead of the session | test_switch_runs_client_and_sets_state
+-   local cmd="${STATE_DIR}/client.sh attach ${id}"
++   local cmd="${STATE_DIR}/client.sh agents"
+
+@@ a switch does not record what is displayed | test_switch_runs_client_and_sets_state
+-   cs_set_displayed "${id}"
+-   SHOWN="${id}"
+-   cs_cleanup_new_session "${id}"
++   SHOWN="${id}"
++   cs_cleanup_new_session "${id}"
+
+@@ terminals move while the old client is still attached | test_switch_chain_order
+-     chain+=(respawn-pane -k -t "${CLIENT_PANE}" "${CS_SLEEP_CMD}" ';')
+
+@@ a switch takes any id | test_switch_refuses_bad_id
+-   local id="$1"
+-   [[ "${id}" =~ ${ID_RE} ]] || return 1
+-   [[ "${id}" == "${SHOWN}" ]] && return 0
++   local id="$1"
++   [[ "${id}" == "${SHOWN}" ]] && return 0
+
+@@ a switch leaves the old title on the pane | test_switch_no_readopt
+-   local -a chain=(select-pane -t "${CLIENT_PANE}" -T "${CS_T_SWITCHING}" ';')
++   local -a chain=()
+
+@@ the client pane is respawned with an empty target | test_empty_client_target_refused
+-   [[ -n "${CLIENT_PANE:-}" && -n "${marker}" && -n "${cmd}" ]] || return 1
++   [[ -n "${marker}" && -n "${cmd}" ]] || return 1
+
+@@ a failed switch does not fall back to welcome | test_switch_failure_ends_on_welcome
+-     cs_show_welcome
+-     cs_slot_sweep
+-     return 1
++     cs_slot_sweep
++     return 1
+
+@@ a failed switch leaves its slot behind | test_switch_failure_ends_on_welcome
+-   if ! _tmux "${chain[@]}" 2>/dev/null; then
+-     cs_slot_discard "${slot}"
+-     return 1
++   if ! _tmux "${chain[@]}" 2>/dev/null; then
++     return 1
+&&
+-     cs_show_welcome
+-     cs_slot_sweep
+-     return 1
++     cs_show_welcome
++     return 1
+
+@@ agent view with a count in its title is not recognized | test_follow_title_mapping
+-     "${CS_T_AGENTS}"|"claude agents"|*" · claude agents")
++     "${CS_T_AGENTS}"|"claude agents")
+
+@@ a name two sessions share is followed | test_follow_title_mapping
+-       if ((count == 1)); then
++       if ((count >= 1)); then
+
+@@ another project's session is adopted | test_follow_title_mapping
+-         if [[ "${AG_CWD[${found}]%%/.claude/worktrees/*}" == "${PWD}" && "${found}" != "${DISPLAYED}" ]]; then
++         if [[ "${found}" != "${DISPLAYED}" ]]; then
+
+@@ agent view is marked as an exit | test_agents_view_keeps_displayed
+-   if cs_client_respawn "${CS_T_AGENTS}" "${STATE_DIR}/client.sh agents"; then
++   if cs_client_respawn "${CS_T_WELCOME}" "${STATE_DIR}/client.sh agents"; then
+
+@@ a client that exits leaves its title on the pane | test_client_exit_clears_displayed test_term_leaves_with_its_session
+-     echo "printf '\\033]2;%s\\033\\\\' '${CS_T_WELCOME}'"
+-     echo 'if ((rc)); then'
++     echo 'if ((rc)); then'
+
+@@ a reload forgets what is shown | test_reload_keeps_shown
+-   if [[ "${CLIENT_TITLE}" == "${CS_T_SWITCHING}" ]]; then
+-     SHOWN="${DISPLAYED}"
++   if [[ "${CLIENT_TITLE}" == "${CS_T_SWITCHING}" ]]; then
++     SHOWN=""
+
+@@ a scan does not bring back a dead client pane | test_client_pane_recreated
+-   if [[ -z "${CLIENT_PANE}" ]] || ! cs_pane_alive "${CLIENT_PANE}"; then
+-     cs_client_ensure
+-     cs_refresh_pane_cache
+-   fi
+-   cs_term_reconcile
+-   cs_follow
++   cs_term_reconcile
++   cs_follow
+
+@@ a switch does not bring back a dead client pane | test_switch_recreates_dead_client
+-   if [[ -z "${CLIENT_PANE}" ]] || ! cs_pane_alive "${CLIENT_PANE}"; then
+-     cs_client_ensure || return 1
+-     cs_refresh_pane_cache
+-   fi
+
+# ── actions ──────────────────────────────────────
+
+@@ a new session is not waited for | test_new_session_waits_for_id
+-   local deadline=$((SECONDS + 5))
++   local deadline=$((SECONDS - 1))
+
+@@ a session started elsewhere is taken for the new one | test_new_session_id_from_list
+-         [[ "${AG_CWD[${cand}]%%/.claude/worktrees/*}" == "${PWD}" ]] || continue
+
+@@ an old session is taken for the new one | test_new_session_id_from_list
+-         [[ "${before}" == *" ${cand} "* ]] && continue
+
+@@ a failing claude --bg is not reported | test_new_session_failure_reported
+-     FOOTER_MSG="${first:-claude --bg failed}"
++     FOOTER_MSG=""
+
+@@ an untrusted directory does not open agent view | test_new_session_untrusted_opens_agents
+-     if [[ "${out,,}" == *"not trusted"* ]]; then
+-       cs_open_agents
+-     fi
+
+@@ an untouched session is judged on a stale list | test_untouched_cleanup_guard
+-   cs_poll 1 || return 0
+-   [[ "${AG_STATE[${nid}]:-}" == "blocked" && "${AG_STATUS[${nid}]:-}" == "idle" ]] || return 0
++   [[ "${AG_STATE[${nid}]:-}" == "blocked" && "${AG_STATUS[${nid}]:-}" == "idle" ]] || return 0
+
+@@ a new session with a transcript is removed | test_untouched_cleanup_guard
+-   [[ -z "${AG_TPATH[${nid}]:-}" ]] || return 0
+
+@@ an untouched new session is never removed | test_untouched_cleanup_guard
+-   cs_claude rm "${nid}" > /dev/null 2>&1 || true
+
+@@ the answer to stop is not shown | test_stop_shows_feedback
+-   FOOTER_MSG="${out%%$'\n'*}"
++   FOOTER_MSG=""
+
+@@ stop does not wait for a yes | test_stop_shows_feedback
+-   cs_confirm "${CS_CLR_PROMPT_WARN}" "${prompt}" || return 0
++   cs_confirm "${CS_CLR_PROMPT_WARN}" "${prompt}" || true
+
+@@ the list is not refreshed after a remove | test_remove_drops_the_row
+-   if cs_poll 1; then
++   if true; then
+
+@@ a prefix key acts on the cursor row | test_prefix_stop_targets_shown
+-   if [[ "${_pf}" != "1" ]]; then
+-     cs_cursor_to_shown || true
+-   fi
+
+@@ a key pressed in the picker acts on the shown session | test_prefix_stop_targets_shown
+-   if [[ "${_pf}" != "1" ]]; then
+-     cs_cursor_to_shown || true
++   if true; then
++     cs_cursor_to_shown || true
+
+@@ the question is asked before the list is drawn again | test_prefix_stop_targets_shown
+-   cs_picker_render
+-   cs_confirm_end "$@"
++   cs_confirm_end "$@"
+
+@@ the shutdown question does not mention terminals | test_shutdown_prompt
+-       prompt="Shutdown, kill terminals? y/N"
++       prompt="Shutdown? y/N"
+
+# ── what the picker draws ────────────────────────
+
+@@ a note is drawn at the left edge | test_footer_note test_empty_list_note
+-   cs_print_centered "$((row + 1))" "${text:0:width}" "${width}" "${CS_CLR_BELL}"
++   printf '\e[%d;1H\e[K%b%s\e[0m' "$((row + 1))" "${CS_CLR_BELL}" "${text:0:width}"
+
+@@ a note is not cut to the pane | test_footer_note
+-   cs_print_centered "$((row + 1))" "${text:0:width}" "${width}" "${CS_CLR_BELL}"
++   cs_print_centered "$((row + 1))" "${text}" "${width}" "${CS_CLR_BELL}"
+
+@@ a note has no empty row above it | test_footer_note test_empty_list_note
+-   cs_print_centered "$((row + 1))" "${text:0:width}" "${width}" "${CS_CLR_BELL}"
++   cs_print_centered "${row}" "${text:0:width}" "${width}" "${CS_CLR_BELL}"
+
+@@ a note is drawn in the dim colour | test_footer_note
+-   cs_print_centered "$((row + 1))" "${text:0:width}" "${width}" "${CS_CLR_BELL}"
++   cs_print_centered "$((row + 1))" "${text:0:width}" "${width}"
+
+@@ the version is drawn over the note | test_footer_note
+-       version_line=$((quit_line + 4))
++       version_line=$((quit_line + 2))
+
+@@ a full list keeps its rows when a note is shown | test_footer_note
+-   [[ -n "${note}" ]] && avail=$((avail - 2))
+
+@@ a failing poll is not shown as a note | test_footer_note
+-   ((SEARCH_ACTIVE)) || note="${POLL_ERROR:-${FOOTER_MSG}}"
++   ((SEARCH_ACTIVE)) || note="${FOOTER_MSG}"
+
+@@ a note takes rows from the list while searching | test_footer_note
+-   ((SEARCH_ACTIVE)) || note="${POLL_ERROR:-${FOOTER_MSG}}"
++   note="${POLL_ERROR:-${FOOTER_MSG}}"
+
+@@ a command's line is not shown with an empty list | test_empty_list_note
+-     cs_render_note 3 "${width}" "${FOOTER_MSG}" || true
+
+# ── attention ────────────────────────────────────
+
+@@ a session never shown is flagged | test_unseen_rules
+-     [[ -v "SEEN_AT[${id}]" ]] || continue
+
+@@ a transcript's mtime raises a bell | test_unseen_rules
+-     if [[ "${AG_ACT_SRC[${id}]:-}" == "record" ]] && ((AG_ACT[${id}] > SEEN_AT[${id}])); then
++     if ((AG_ACT[${id}] > SEEN_AT[${id}])); then
+
+@@ a working session is flagged as finished | test_unseen_rules
+-     [[ "${st}" == "done" || "${st}" == "failed" ]] || continue
+
+@@ housekeeping records count as activity | test_unseen_rules
+-       | select(.type == "user" or .type == "assistant"
+-                or (.type == "system" and .subtype == "turn_duration"))
++       | select(.type != "")
+
+@@ looking at a session does not clear its flag | test_mark_seen_clears_unseen
+-   printf -v "SEEN_AT[${id}]" '%(%s)T' -1
+-   unset "UNSEEN_SET[${id}]"
+
+@@ looking at a session is not recorded on disk | test_mark_seen_clears_unseen test_seen_needs_window_focus
+-   { : > "${SEEN_DIR}/${id}"; } 2>/dev/null || return 0
+
+@@ a session counts as seen while the window has no focus | test_seen_needs_window_focus
+-   if [[ -n "${SHOWN}" ]] && ((WINDOW_FOCUSED)); then
++   if [[ -n "${SHOWN}" ]]; then
+
+@@ a seen file is swept after one poll | test_seen_sweep
+-     if ((SEEN_ABSENT[${id}] >= 5)); then
++     if ((SEEN_ABSENT[${id}] >= 1)); then
+
+@@ a failed poll counts towards the sweeps | test_seen_sweep test_term_killed_only_when_session_is_gone
+-   cs_agents_refresh "${1:-0}" || return 1
++   cs_agents_refresh "${1:-0}" || true
+
+# ── other projects ───────────────────────────────
+
+@@ a hop does not say which session to show | test_hop_writes_switch_target test_e2e_hop
+-   printf '%s\n%s\n' "${target_path}" "${id}" > "${STATE_DIR}/switch_target"
++   printf '%s\n' "${target_path}" > "${STATE_DIR}/switch_target"
+
+@@ selecting another project's session does nothing | test_hop_writes_switch_target
+-     remote) cs_switch_to_project "${ENTRIES_PATH[${SELECTED}]}" "${ENTRIES_ID[${SELECTED}]}" ;;
+
+@@ a hop can show another project's session here | test_pending_load_shows_session
+-   [[ "${idx}" != "-1" && "${ENTRIES_TYPE[${idx}]}" == "local" ]] || return 0
++   [[ "${idx}" != "-1" ]] || return 0
+
+@@ a hop's request is never cleared | test_pending_load_shows_session
+-   rm -f "${STATE_DIR}/pending_load"
+
+@@ the launcher drops the session a hop asked for | test_e2e_hop
+-         [[ "${target_id}" =~ ${ID_RE} ]] && pending="${target_id}"
+
+# ── terminals ────────────────────────────────────
+
+@@ a terminal opens in the project root | test_term_opens_in_session_cwd
+-   local dir="${AG_CWD[$1]:-}" _sh="${SHELL:-/bin/bash}"
++   local dir="${PWD}" _sh="${SHELL:-/bin/bash}"
+
+@@ the terminal key works with nothing displayed | test_term_keys_need_a_session
+-   local orient="${1:-}" id="${DISPLAYED}" cur tp active
+-   [[ -n "${id}" ]] || return 0
++   local orient="${1:-}" id="${DISPLAYED}" cur tp active
+&&
+-   local id="$1" orient="$2" tp cur size
+-   [[ "${id}" =~ ${ID_RE} ]] || return 1
++   local id="$1" orient="$2" tp cur size
+
+@@ a parked terminal's window is not pinned to its size | test_term_survives_switch test_slot_sweep test_e2e_parking_keeps_terminal_size
+-   if ! _tmux set -p -t "${slot}" @ca_placeholder 1 \; \
+-              resize-window -t "${slot}" -x "${PANE_W[${tp}]}" -y "${PANE_H[${tp}]}" 2>/dev/null; then
++   if ! _tmux set -p -t "${slot}" @ca_placeholder 1 2>/dev/null; then
+
+@@ terminals of the same layout do not trade places | test_term_same_layout_swap test_switch_chain_order
+-   elif [[ -n "${out_tp}" && -n "${in_tp}" && "${in_orient}" == "${out_orient}" \
++   elif [[ -z "${out_tp}" && -n "${in_tp}" && "${in_orient}" == "${out_orient}" \
+
+@@ a terminal is brought back at tmux's default size | test_term_different_layout_switch
+-       chain+=(join-pane "${TERM_HOW[@]}" -d -s "${in_tp}" -t "${CLIENT_PANE}" -l "${size}" ';')
++       chain+=(join-pane "${TERM_HOW[@]}" -d -s "${in_tp}" -t "${CLIENT_PANE}" ';')
+
+@@ the terminal of the session left stays in the window | test_term_different_layout_switch test_switch_chain_order
+-       chain+=(swap-pane -d -s "${out_tp}" -t "${slot}" ';' kill-pane -t "${slot}" ';')
+
+@@ a terminal's size is computed again on every switch | test_term_keeps_its_own_size
+-     [[ "${area}" == "${full_w}x${full_h}" ]] || tp=""
++     tp=""
+
+@@ a parked terminal keeps its size after the window changed | test_term_refit_after_window_change
+-     [[ "${area}" == "${full_w}x${full_h}" ]] || tp=""
+
+@@ hiding a terminal does not record that it is hidden | test_term_hide_and_show
+-   rm -f "${STATE_DIR}/term/${id}.shown"
+-   cs_refresh_geom
++   cs_refresh_geom
+
+@@ a parked terminal's window is not named | test_term_hide_and_show
+-   cs_rename_pane_window "${tp}" "ca:term"
+
+@@ a terminal's orientation is not remembered | test_term_orientation_change
+-   echo "${orient}" > "${STATE_DIR}/term/${id}.orient"
+
+@@ a terminal whose shell exited is still tracked | test_term_shell_exit_forgets
+-     if [[ -z "${tp}" ]] || ! cs_pane_alive "${tp}"; then
+-       cs_term_forget "${id}"
+-     fi
+
+@@ removing a session leaves its terminal | test_term_stop_keeps_remove_kills
+-     [[ -v "AG_STATE[${id}]" ]] || cs_term_kill "${id}"
++     :
+
+@@ stopping a session kills its terminal | test_term_stop_keeps_remove_kills
+-     [[ -v "AG_STATE[${id}]" ]] || cs_term_kill "${id}"
++     cs_term_kill "${id}"
+
+@@ a terminal is killed the first time its session is missing | test_term_killed_only_when_session_is_gone
+-     if ((TERM_ABSENT[${id}] >= 5)); then
++     if ((TERM_ABSENT[${id}] >= 1)); then
+
+@@ a session opened from agent view comes without its terminal | test_follow_brings_terminal
+-           if cs_term_is_shown "${found}"; then
+-             local _fo
+-             cs_term_orient _fo "${found}"
+-             cs_term_show "${found}" "${_fo}" || true
+-           fi
+
+@@ a session opened from agent view keeps the other one's terminal | test_follow_brings_terminal
+-           cs_term_park_shown
+-           cs_set_displayed "${found}"
++           cs_set_displayed "${found}"
+
+@@ a client that exits leaves its terminal in the window | test_term_leaves_with_its_session
+-         cs_set_displayed ""
+-         cs_term_park_shown
++         cs_set_displayed ""
+
+@@ the welcome screen keeps the terminal | test_term_leaves_with_its_session test_term_stop_keeps_remove_kills
+-   # Only now, with no client attached, does the terminal leave the window.
+-   cs_term_park_shown
+
+@@ the sweep leaves slots behind | test_slot_sweep
+-     _tmux kill-window -t "${wrep["${wid}"]}" 2>/dev/null || true
+
+@@ the sweep takes every window for a slot | test_slot_sweep
+-     if [[ "${flag}" == "1" ]]; then
++     if true; then
+
+@@ an auto-hidden terminal keeps its squeezed size | test_term_fixed_autohide
+-   # the resize squeezed it before it was hidden: that size is not one to keep
+-   rm -f "${STATE_DIR}/term/${id}.area"
+
+@@ a fixed-size side terminal is squeezed, not hidden | test_term_fixed_autohide
+-       if [[ "${TERMINAL_WIDTH}" != *% && ! -f "${STATE_DIR}/term/${id}.keep" ]]; then
+-         cs_term_autohide "${id}" "${tp}"
+-         return 0
+-       fi
+
+@@ a terminal reopened without room is hidden again | test_term_fixed_autohide
+-       if [[ "${TERMINAL_WIDTH}" != *% && ! -f "${STATE_DIR}/term/${id}.keep" ]]; then
++       if [[ "${TERMINAL_WIDTH}" != *% ]]; then
+
+@@ a fixed-size bottom terminal is squeezed, not hidden | test_term_fixed_autohide_bottom
+-       if [[ "${TERMINAL_HEIGHT}" != *% && ! -f "${STATE_DIR}/term/${id}.keep" ]]; then
+-         cs_term_autohide "${id}" "${tp}"
+-         return 0
+-       fi
+
+@@ a percentage terminal squeezes Claude below its minimum | test_term_percent_squeeze
+-     max=$(( total - MIN_CLAUDE_WIDTH ))
++     max=$(( total ))
+
+@@ a squeezed share is saved | test_term_percent_squeeze
+-     if (( tw + sw > 0 && sw > MIN_CLAUDE_WIDTH )); then
++     if (( tw + sw > 0 )); then
+
+@@ a percentage terminal is hidden on a shrink | test_term_percent_squeeze
+-       if [[ "${TERMINAL_WIDTH}" != *% && ! -f "${STATE_DIR}/term/${id}.keep" ]]; then
++       if [[ ! -f "${STATE_DIR}/term/${id}.keep" ]]; then
+
+# ── code copied from claude-spaces ───────────────
+
+@@ a lone project is shown by its full path | test_display_names_single_path test_display_names_different_leaves
+-       DISPLAY_NAMES["${_p}"]="${_leaf}"
++       DISPLAY_NAMES["${_p}"]="${_p}"
+
+@@ projects with the same folder name are not told apart | test_display_names_same_leaf_different_parent test_display_names_deep_divergence test_display_names_three_way_collision test_other_projects_rows
+-       cs_resolve_collision_group group
+
+@@ long paths are not shortened | test_display_names_deep_divergence test_display_names_compression
+-     echo "${suffix%%/*}/.../${suffix##*/}"
++     echo "${suffix}"
+
+@@ shortening may make two names the same | test_display_names_three_way_collision
+-         if ((comp_count["${compressed[gi]}"] > 1)); then
++         if false; then
+
+@@ the working directory is not resolved | test_symlinked_cwd_finds_sessions
+-   cd -P "${PWD}" || exit 1
++   cd "${PWD}" || exit 1
+
+@@ ages in hours are shown as minutes | test_out_var_helpers
+-     printf -v "${_out}" '%s' "$((diff / 3600))h"
++     printf -v "${_out}" '%s' "$((diff / 3600))m"
+
+@@ a row that is not there is found at index 0 | test_out_var_helpers
+-   printf -v "${_out}" '%s' "-1"
++   printf -v "${_out}" '%s' "0"
+
+@@ the sort memo is never used | test_sort_memo
+-   if [[ -n "${SORT_MEMO_IN[${_key}]+x}" && "${SORT_MEMO_IN[${_key}]}" == "${_in}" ]]; then
++   if false; then
+
+@@ the sort memo is used for different input | test_sort_memo
+-   if [[ -n "${SORT_MEMO_IN[${_key}]+x}" && "${SORT_MEMO_IN[${_key}]}" == "${_in}" ]]; then
++   if [[ -n "${SORT_MEMO_IN[${_key}]+x}" ]]; then
+
+@@ a title is cut at its first space | test_pane_cache
+-     [[ "${_rest}" != "${_o}" ]] && CLIENT_TITLE="${_rest%%$'\n'*}"
++     [[ "${_rest}" != "${_o}" ]] && CLIENT_TITLE="${_rest%% *}"
+
+@@ a dead client pane is given another pane's title | test_pane_cache
+-     [[ "${_rest}" != "${_o}" ]] && CLIENT_TITLE="${_rest%%$'\n'*}"
++     CLIENT_TITLE="${_rest%%$'\n'*}"
+
+@@ the number of attached clients is not read | test_pane_cache
+-     [[ "${_last##* }" =~ ^[0-9]+$ ]] && SESSION_ATTACHED="${_last##* }"
+
+@@ the list is refreshed with nobody attached | test_poll_only_while_attached
+-   ((SESSION_ATTACHED > 0)) || return 0
+
+@@ the poll interval is ignored | test_poll_only_while_attached
+-   ((now - LAST_POLL >= POLL_INTERVAL)) || return 0
+&&
+-       [[ -n "${json}" ]] && from_cache=1
+
+@@ the shared cache is never used | test_poll_cache_shared
+-       [[ -n "${json}" ]] && from_cache=1
+
+@@ a forced refresh reads the cache | test_poll_cache_shared
+-   if ((!force)) && [[ -f "${cache}" ]]; then
++   if [[ -f "${cache}" ]]; then
+
+@@ a missing state file leaves the old value | test_read_state_into
+-   printf -v "$1" '%s' "${_v}"
++   [[ -z "${_v}" ]] || printf -v "$1" '%s' "${_v}"
+
+@@ the project name is run as code by the welcome screen | test_scripts_injection_safe
+-     printf 'echo %q\n' "  Project: ${_wname} (${PWD})"
++     echo "echo \"  Project: ${_wname} (${PWD})\""
+
+@@ the project path is run as code by the client script | test_scripts_injection_safe
+-     printf 'if cd %q; then\n' "${PWD}"
++     echo "if cd ${PWD}; then"
+
+@@ numeric config values are not checked | test_config_injection_safe test_config_keys
+-         if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
++         if false; then
+
+@@ size config values are not checked | test_config_injection_safe test_config_keys
+-         if [[ ! "${value}" =~ ^[0-9]+%?$ ]]; then
++         if false; then
+
+@@ poll_interval is not read from the config | test_config_keys
+-       poll_interval) POLL_INTERVAL="${value}" ;;
+
+@@ a symlinked state root is accepted | test_state_root_symlink_guard
+-   [[ -L "${CS_STATE_ROOT}" ]] && { echo "ERROR: ${CS_STATE_ROOT} is a symlink — aborting" >&2; exit 1; }
+&&
+-   [[ -L "${CS_STATE_ROOT}" || ! -O "${CS_STATE_ROOT}" ]] && { echo "ERROR: ${CS_STATE_ROOT} swapped after mkdir" >&2; exit 1; }
+
+@@ a trailing slash stays on state_root | test_config_state_root
+-         value="${value%/}"
+
+@@ state_root may be the home directory | test_config_state_root
+-         if [[ "${value}" != /* || "${value}" == "${HOME}" ]]; then
++         if [[ "${value}" != /* ]]; then
+
+@@ a tilde in tmux_conf is not expanded | test_config_tmux_conf_tilde
+-         # already degrades gracefully via the -f guard in cs_launch.
+-         value=$(cs_expand_tilde "${value}")
++         # already degrades gracefully via the -f guard in cs_launch.
+
+@@ the state dir's path is pasted into the focus hook | test_hook_injection_safe
+-   _tmux set-hook -g client-focus-in 'run-shell "touch \"\$CS_FOCUS_IN\""'
++   _tmux set-hook -g client-focus-in "run-shell \"touch ${STATE_DIR}/focus_in\""
+
+# ── launcher ─────────────────────────────────────
+
+@@ a newer minor version is taken for an older one | test_version_check
+-     ((x > y)) && return 0
+
+@@ the preflight does not try the session list | test_preflight_claude test_e2e_preflight_refuses
+-   if ! out=$(cs_claude agents --json 2>&1 >/dev/null); then
++   if ! out=$(true); then
+
+@@ Q does not detach | test_e2e_launch_detach_reattach
+-           Q) _tmux detach-client ;;
++           Q) : ;;
+
+@@ title recording is left as the user's tmux.conf set it | test_e2e_launch_detach_reattach
+-       _tmux set -gw allow-set-title on
+&&
+-   _tmux set -gw allow-set-title on 2>/dev/null || true
+
+@@ agent view is not on prefix v | test_e2e_prefix_table
+-   cs_bind agents v send-keys -t "${PICKER_PANE}" $'\x10'
++   cs_bind agents a send-keys -t "${PICKER_PANE}" $'\x10'
+
+@@ prefix a is not the literal grave | test_e2e_prefix_table
+-   _tmux bind-key a send-keys '`'
+
+@@ fork is back on prefix f | test_e2e_prefix_table
+-   cs_bind agents v send-keys -t "${PICKER_PANE}" $'\x10'
++   cs_bind agents v send-keys -t "${PICKER_PANE}" $'\x10'
++   _tmux bind-key f send-keys -t "${PICKER_PANE}" f
+
+@@ new code runs against an old server's layout | test_e2e_compat_gate
+-   if [[ "$(cs_read_state compat_version)" != "${CS_COMPAT_VERSION}" ]]; then
+-     : > "${STATE_DIR}/restart_required"
+-     _tmux kill-server 2>/dev/null || true
+-     exit 0
+-   fi
+
+@@ the launcher says nothing after a layout change | test_e2e_compat_gate
+-       echo "claude-agents was updated and the layout changed, so the view was closed."
++       echo "closed."
+
+# ── the check that runs after every test ─────────
+
+@@ the check's verdict is always a failure | test_version_check | harness
+-   return "${errors}"
++   return 1
+
+@@ the check ignores placeholders | test_invariant_check_notices | harness
+-     if [[ "${tagged[${p}]}" == "1" ]]; then
++     if false; then
+
+@@ the check ignores panes nobody tracks | test_invariant_check_notices | harness
+-     if [[ -z "${tracked[${p}]:-}" ]]; then
++     if false; then
+
+@@ the check ignores a terminal beside the wrong session | test_invariant_check_notices | harness
+-       if [[ "${id}" != "${displayed}" ]]; then
++       if false; then
+
+@@ the check ignores a hidden terminal in the main window | test_invariant_check_notices | harness
+-       if [[ ! -f "${f}.shown" ]]; then
++       if false; then
+
+@@ the check ignores a terminal whose pane is gone | test_invariant_check_notices | harness
+-     if [[ -z "${tp}" || -z "${win[${tp}]:-}" ]]; then
++     if false; then
+
+@@ the check ignores a shown mark with no terminal | test_invariant_check_notices | harness
+-       if [[ ! -f "${f%.shown}" ]]; then
++       if false; then
+
+@@ the check ignores a missing client pane | test_invariant_check_notices | harness
+-   if [[ -z "${cp}" || -z "${win[${cp}]:-}" ]]; then
++   if false; then
+
+@@ the check ignores two terminals in the main window | test_invariant_check_notices | harness
+-   if ((in_main_count > 1)); then
++   if false; then
+
+@@ the check ignores a parked terminal that should be visible | test_invariant_check_notices | harness
+-     if [[ -n "${tp}" && -n "${win[${tp}]:-}" && "${win[${tp}]}" != "${win[${pp}]}" ]]; then
++     if false; then
+BREAKS
+
+main

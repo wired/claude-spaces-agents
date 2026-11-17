@@ -1576,6 +1576,7 @@ cs_open_agents() {
     _tmux select-pane -t "${CLIENT_PANE}" 2>/dev/null || true
   else
     cs_client_ensure
+    return 1
   fi
 }
 
@@ -2302,9 +2303,10 @@ cs_new_session() {
   if ((rc != 0)); then
     FOOTER_MSG="${first:-claude --bg failed}"
     # `claude --bg` has no terminal here and cannot ask. Agent view can: it shows
-    # Claude's trust dialog for a directory that was never opened before.
+    # Claude's trust dialog for a directory that was never opened before. The
+    # dialog says what the message would, so the message is dropped.
     if [[ "${out,,}" == *"not trusted"* ]]; then
-      cs_open_agents
+      cs_open_agents && FOOTER_MSG=""
     fi
     return 1
   fi

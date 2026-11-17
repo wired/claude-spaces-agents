@@ -397,8 +397,17 @@ load_breaks << 'BREAKS'
 
 @@ an untrusted directory does not open agent view | test_new_session_untrusted_opens_agents
 -     if [[ "${out,,}" == *"not trusted"* ]]; then
--       cs_open_agents
+-       cs_open_agents && FOOTER_MSG=""
 -     fi
+
+@@ the trust message stays beside Claude's dialog | test_new_session_untrusted_opens_agents
+-       cs_open_agents && FOOTER_MSG=""
++       cs_open_agents
+
+@@ agent view that could not be opened drops the trust message | test_new_session_untrusted_opens_agents
+-     cs_client_ensure
+-     return 1
++     cs_client_ensure
 
 @@ an untouched session is judged on a stale list | test_untouched_cleanup_guard
 -   cs_poll 1 || return 0

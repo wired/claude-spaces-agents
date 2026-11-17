@@ -400,14 +400,19 @@ terminal keys, rename project, detach, reload, config).
 - **Command output is shown.** A command's message goes to the picker's footer, on success as
   well as on failure. Known failures: `Workspace not trusted` from `claude --bg` in a directory
   never opened before, and `kept <id>` with a reason from `claude rm`.
-- **Where it is shown.** A note is a failing poll, or else the last command's message. It has a
-  row of its own between the key hints and the version: centered, in the bell colour, cut to
-  the pane's width, with an empty row above and below. The version stays, two rows lower. A
-  command's message goes away at the next key; a poll error stays until a poll succeeds.
-  - A list that fills the pane gives up two rows while a note is shown, so the note always has
-    its three.
-  - With no sessions there is no footer. The command's message is drawn the same way under the
-    empty-list text; a failing poll replaces that text, as before.
+- **Where it is shown.** A note is a failing poll, or else the last command's message. It has
+  rows of its own between the key hints and the version: centered, in the bell colour, with an
+  empty row above and below. The version stays, below it. A command's message goes away at the
+  next key; a poll error stays until a poll succeeds.
+  - A note longer than the pane's width is split into two rows. The break is the last space
+    that keeps the first row within the width, or the width itself when there is no such
+    space. The second row is cut to the width. There is no third row.
+  - A list that fills the pane gives up two rows while a note is shown, and three when the
+    note has two rows, so the note always has its rows and the empty ones.
+  - With no sessions there is no footer, and an empty list has no text of its own. A failing
+    poll is shown on the row under the header, indented and in the dim colour, and split into
+    two rows by the same rule. The command's message is drawn as a note under that: its first
+    row is the fourth of the pane, or the fifth under a failing poll on two rows.
   - The search view shows no note.
 - **Jump numbers** go to the first ten rows of this project, in display order. claude-spaces
   gave the first slots to running sessions, a distinction that no longer exists.

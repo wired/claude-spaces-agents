@@ -1450,9 +1450,10 @@ test_shutdown_prompt() {
 
 # ── Tests: what the picker draws ─────────────────
 
-# A note (a command's own line, or a failing poll) has a row of its own between
-# the key hints and the version: centered, in the bell colour, cut to the pane,
-# with an empty row above and below. The version stays, two rows lower.
+# A note (a command's own line, or a failing poll) has rows of its own between
+# the key hints and the version: centered, in the bell colour, on two rows when
+# it is longer than the pane, with an empty row above and below. The version
+# stays, below it.
 test_footer_note() {
   fake_add aaaaaaa1 done idle "alpha"
   fake_add aaaaaaa2 done idle "beta"
@@ -1481,11 +1482,40 @@ test_footer_note() {
   screen_rows 40 20 colors
   [[ "${row[8]}" == *$'\e[31m'*"stopped aaaaaaa1"* ]] || { fail "the note is not in the bell colour: $(printf '%q' "${row[8]}")"; return 1; }
 
-  # longer than the pane: cut, not wrapped
+  # Longer than the pane: two rows, split at the last space that fits, each
+  # centered. The version goes one row lower.
+  local long="kept aaaaaaa1: the session still has work that is not saved"
+  local long1 long2
+  long1=$(centered40 "kept aaaaaaa1: the session still has")
+  long2=$(centered40 "work that is not saved")
+  FOOTER_MSG="${long}"
+  screen_rows 40 20
+  assert_eq "a long note: key hints" "${row[6]}" "${hints}" || return 1
+  assert_eq "a long note: the row above" "${row[7]}" "" || return 1
+  assert_eq "a long note: the first row" "${row[8]}" "${long1}" || return 1
+  assert_eq "a long note: the second row" "${row[9]}" "${long2}" || return 1
+  assert_eq "a long note: the row below" "${row[10]}" "" || return 1
+  assert_eq "a long note: the version" "${row[11]}" "${version}" || return 1
+  assert_eq "a long note: the row below the version" "${row[12]}" "" || return 1
+
+  # a space right after the last column: the first row is full
+  FOOTER_MSG="0123456789 123456789 123456789 123456789 tail"
+  screen_rows 40 20
+  assert_eq "a full first row" "${row[8]}" "0123456789 123456789 123456789 123456789" || return 1
+  assert_eq "the row after a full first row" "${row[9]}" "$(centered40 "tail")" || return 1
+
+  # no space to split at: split at the last column
   FOOTER_MSG="0123456789012345678901234567890123456789ABCDEFGHIJKLMNOPQRST"
   screen_rows 40 20
-  assert_eq "a long note" "${row[8]}" "0123456789012345678901234567890123456789" || return 1
-  assert_eq "the row below a long note" "${row[9]}" "" || return 1
+  assert_eq "no space: the first row" "${row[8]}" "0123456789012345678901234567890123456789" || return 1
+  assert_eq "no space: the second row" "${row[9]}" "$(centered40 "ABCDEFGHIJKLMNOPQRST")" || return 1
+  assert_eq "no space: the row below" "${row[10]}" "" || return 1
+
+  # too long for two rows: the second is cut, there is no third
+  FOOTER_MSG="0123456789012345678901234567890123456789abcdefghijklmnopqrstuvwxyzabcdefghijklmnCUT"
+  screen_rows 40 20
+  assert_eq "too long: the second row" "${row[9]}" "abcdefghijklmnopqrstuvwxyzabcdefghijklmn" || return 1
+  assert_eq "too long: the row below" "${row[10]}" "" || return 1
 
   # a failing poll is the note, before any command's line
   FOOTER_MSG="stopped aaaaaaa1"
@@ -1509,6 +1539,14 @@ test_footer_note() {
   assert_eq "full list: the row above the note" "${row[18]}" "" || return 1
   assert_eq "full list: the note" "${row[19]}" "${note}" || return 1
   assert_eq "full list: the row below the note" "${row[20]}" "" || return 1
+  # a note on two rows takes one more row from the list
+  FOOTER_MSG="${long}"
+  screen_rows 40 20
+  assert_eq "full list, two rows: key hints" "${row[16]}" "${hints}" || return 1
+  assert_eq "full list, two rows: the row above" "${row[17]}" "" || return 1
+  assert_eq "full list, two rows: the first row" "${row[18]}" "${long1}" || return 1
+  assert_eq "full list, two rows: the second row" "${row[19]}" "${long2}" || return 1
+  assert_eq "full list, two rows: the row below" "${row[20]}" "" || return 1
   FOOTER_MSG=""
   screen_rows 40 20
   assert_eq "full list, no note: key hints are back down" "${row[19]}" "${hints}" || return 1
@@ -1522,27 +1560,51 @@ test_footer_note() {
     || { fail "searching: the list lost rows to a note that is not shown: '${row[16]}'"; return 1; }
 }
 
-# With no sessions there is no footer. A command that failed still has to say
-# so: its line goes under the empty-list text, drawn like any other note.
+# With no sessions there is no footer, and no text either. A command that failed
+# still has to say so: its line is drawn like any other note, and a failing
+# poll has the rows above it.
 test_empty_list_note() {
   cs_rescan
   local -a row
   screen_rows 40 20
-  assert_eq "the empty-list text" "${row[2]}" "  No sessions. :c starts one" || return 1
+  assert_eq "an empty list has no text" "${row[2]}" "" || return 1
   assert_eq "no note" "${row[4]}" "" || return 1
 
   FOOTER_MSG="Could not start the service"
   screen_rows 40 20
-  assert_eq "the empty-list text, with a note" "${row[2]}" "  No sessions. :c starts one" || return 1
+  assert_eq "the row under the header, with a note" "${row[2]}" "" || return 1
   assert_eq "the row above the note" "${row[3]}" "" || return 1
   assert_eq "the note" "${row[4]}" "$(centered40 "${FOOTER_MSG}")" || return 1
   assert_eq "the row below the note" "${row[5]}" "" || return 1
 
+  # a note longer than the pane is on two rows here as well
+  FOOTER_MSG="kept aaaaaaa1: the session still has work that is not saved"
+  screen_rows 40 20
+  assert_eq "a long note: the first row" "${row[4]}" "$(centered40 "kept aaaaaaa1: the session still has")" || return 1
+  assert_eq "a long note: the second row" "${row[5]}" "$(centered40 "work that is not saved")" || return 1
+  assert_eq "a long note: the row below" "${row[6]}" "" || return 1
+
   # a failing poll keeps its own row; the command's line is still shown
+  FOOTER_MSG="Could not start the service"
   POLL_ERROR="simulated failure"
   screen_rows 40 20
   assert_eq "a failing poll" "${row[2]}" "  simulated failure" || return 1
-  assert_eq "the note, under a failing poll" "${row[4]}" "$(centered40 "${FOOTER_MSG}")"
+  assert_eq "the note, under a failing poll" "${row[4]}" "$(centered40 "${FOOTER_MSG}")" || return 1
+
+  # A failing poll longer than the pane is on two rows, both indented, and the
+  # command's line starts a row lower.
+  POLL_ERROR="could not read the session list from claude"
+  screen_rows 40 20
+  assert_eq "a long failing poll: the first row" "${row[2]}" "  could not read the session list from" || return 1
+  assert_eq "a long failing poll: the second row" "${row[3]}" "  claude" || return 1
+  assert_eq "a long failing poll: the row above the note" "${row[4]}" "" || return 1
+  assert_eq "a long failing poll: the note" "${row[5]}" "$(centered40 "${FOOTER_MSG}")" || return 1
+  assert_eq "a long failing poll: the row below the note" "${row[6]}" "" || return 1
+
+  # a pane with no columns left after the indent still gets one character a row
+  local -a parts
+  cs_note_split parts "ab cd" -2
+  assert_eq "no columns" "${parts[*]}" "a b"
 }
 
 # ── Tests: attention ─────────────────────────────

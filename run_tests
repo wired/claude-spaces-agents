@@ -1259,6 +1259,20 @@ test_follow_title_mapping() {
   set_client_title "2 awaiting input · claude agents"; look
   assert_eq "agent view with a count" "${SHOWN}" "" || return 1
 
+  # attached in the middle of a tool call, a session sets its own title: its
+  # name behind a status glyph
+  set_client_title "✳ alpha"; look
+  assert_eq "a name behind the idle glyph" "${SHOWN}" "aaaaaaa1" || return 1
+  set_client_title "◐ beta"; look
+  assert_eq "a name behind a spinner frame" "${SHOWN}" "aaaaaaa2" || return 1
+  assert_eq "adopted from behind a glyph" "${DISPLAYED}" "aaaaaaa2" || return 1
+  set_client_title "◑ alpha"; look
+  assert_eq "a name behind the other spinner frame" "${SHOWN}" "aaaaaaa1" || return 1
+  set_client_title "✳ nobody"; look
+  assert_eq "an unknown name behind a glyph" "${SHOWN}" "aaaaaaa1" || return 1
+  set_client_title "✳ dup"; look
+  assert_eq "a shared name behind a glyph" "${SHOWN}" "aaaaaaa1" || return 1
+
   set_client_title "alpha"; look
   set_client_title "Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA"; look
   assert_eq "an unknown title" "${SHOWN}" "aaaaaaa1" || return 1
@@ -1327,7 +1341,15 @@ test_reload_keeps_shown() {
   cs_shown_at_startup
   assert_eq "shown after a reload" "${SHOWN}" "aaaaaaa1" || return 1
   cs_follow
-  assert_eq "shown after the first scan" "${SHOWN}" "aaaaaaa1"
+  assert_eq "shown after the first scan" "${SHOWN}" "aaaaaaa1" || return 1
+  # attached in the middle of a tool call, the session has put its own title in
+  # place of the marker: startup knows nothing, and the first scan finds it
+  set_client_title "✳ alpha"
+  SHOWN=""
+  cs_refresh_pane_cache
+  cs_shown_at_startup
+  cs_follow
+  assert_eq "shown after a reload, own title" "${SHOWN}" "aaaaaaa1"
 }
 
 # A client pane that was killed comes back, with the welcome screen.

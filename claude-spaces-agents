@@ -2427,14 +2427,47 @@ cs_print_centered() {
   printf '\e[%d;1H\e[K%b%*s%s\e[0m' "${line}" "${color}" "${pad}" "" "${text}"
 }
 
+# Split the text $2 for $3 columns into the array named $1: no rows when it is
+# empty, one when it fits, else two. The break is the last space that keeps the
+# first row within the columns, or the last column when there is none. The
+# second row is cut to the columns.
+cs_note_split() {
+  local -n _rows="$1"
+  local text="$2" width="$3"
+  _rows=()
+  [[ -n "${text}" ]] || return 0
+  ((width > 0)) || width=1
+  if ((${#text} <= width)); then
+    _rows=("${text}")
+    return 0
+  fi
+  local first="${text:0:width + 1}" rest
+  if [[ "${first}" == ?*" "* ]]; then
+    first="${first% *}"
+    rest="${text:${#first}}"
+    rest="${rest#"${rest%%[! ]*}"}"
+  else
+    first="${text:0:width}"
+    rest="${text:width}"
+  fi
+  _rows=("${first}")
+  [[ -n "${rest}" ]] && _rows+=("${rest:0:width}")
+  return 0
+}
+
 # A note is a failing poll or the last command's own line (`stopped <id>`,
-# `kept <id> …`). Draw $3 centered on the row after $1, cut to the width $2,
-# with an empty row above and below. Draws nothing and fails when $3 is empty.
+# `kept <id> …`). Draw $3 centered from the row after $1, on one row or split
+# into two for the width $2, with an empty row above and below. Draws nothing
+# and fails when $3 is empty.
 cs_render_note() {
-  local row="$1" width="$2" text="$3"
-  [[ -n "${text}" ]] || return 1
-  printf '\e[%d;1H\e[K\e[%d;1H\e[K' "${row}" "$((row + 2))"
-  cs_print_centered "$((row + 1))" "${text:0:width}" "${width}" "${CS_CLR_BELL}"
+  local row="$1" width="$2" i
+  local -a rows
+  cs_note_split rows "$3" "${width}"
+  ((${#rows[@]})) || return 1
+  printf '\e[%d;1H\e[K\e[%d;1H\e[K' "${row}" "$((row + ${#rows[@]} + 1))"
+  for ((i = 0; i < ${#rows[@]}; i++)); do
+    cs_print_centered "$((row + 1 + i))" "${rows[i]}" "${width}" "${CS_CLR_BELL}"
+  done
 }
 
 # How a session's row looks. Sets the variable named $1 to one of:
@@ -2509,12 +2542,15 @@ cs_picker_render() {
 
   # The search view has no footer to show a note in.
   local note=""
+  local -a note_rows
   ((SEARCH_ACTIVE)) || note="${POLL_ERROR:-${FOOTER_MSG}}"
+  cs_note_split note_rows "${note}" "${width}"
 
   avail=$((height - 5))
-  # A note takes three rows under the key hints, and the footer has one empty
-  # row to give. A list that fills the pane gives up the other two.
-  [[ -n "${note}" ]] && avail=$((avail - 2))
+  # A note takes its one or two rows under the key hints and an empty row on
+  # either side, and the footer has one empty row to give. A list that fills the
+  # pane gives up the rest.
+  ((${#note_rows[@]})) && avail=$((avail - ${#note_rows[@]} - 1))
   ((avail < 1)) && avail=1
 
   local n=${#ENTRIES_ID[@]}
@@ -2539,19 +2575,27 @@ cs_picker_render() {
   fi
 
   if ((n == 0)); then
-    local empty_msg="No sessions. :c starts one"
+    local empty_msg=""
     # a failing poll must never look like an empty list
     [[ -n "${POLL_ERROR}" ]] && empty_msg="${POLL_ERROR}"
     ((SEARCH_ACTIVE)) && empty_msg="No matches."
-    printf '\e[2;1H\e[K%b  %.*s\e[0m' "${CS_CLR_CHROME}" "$((width - 2))" "${empty_msg}"
+    local -a empty_rows
+    cs_note_split empty_rows "${empty_msg}" "$((width - 2))"
+    printf '\e[2;1H\e[K%b  %s\e[0m' "${CS_CLR_CHROME}" "${empty_rows[0]:-}"
     # Clear remaining lines
     local cl
     for ((cl = 3; cl < height; cl++)); do
       printf '\e[%d;1H\e[K' "${cl}"
     done
     # The last command's own line. With no list there is no footer to show it
-    # in, and a failing poll already has the row above.
-    cs_render_note 3 "${width}" "${FOOTER_MSG}" || true
+    # in, and a failing poll already has the rows above: one, or two when it is
+    # split, and then the note starts a row lower.
+    local empty_note_row=3
+    if ((${#empty_rows[@]} > 1)); then
+      printf '\e[3;1H%b  %s\e[0m' "${CS_CLR_CHROME}" "${empty_rows[1]}"
+      empty_note_row=4
+    fi
+    cs_render_note "${empty_note_row}" "${width}" "${FOOTER_MSG}" || true
     if ((SEARCH_ACTIVE)); then
       printf '\e[%d;1H\e[K' "${height}"
       if ((SEARCH_FIELD_FOCUSED)); then
@@ -2726,7 +2770,7 @@ cs_picker_render() {
     # row of its own on either side.
     local version_line=$((quit_line + 2))
     if cs_render_note "$((quit_line + 1))" "${width}" "${note}"; then
-      version_line=$((quit_line + 4))
+      version_line=$((quit_line + 3 + ${#note_rows[@]}))
     else
       printf '\e[%d;1H\e[K' "$((quit_line + 1))"
     fi

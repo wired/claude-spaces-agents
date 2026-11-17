@@ -446,27 +446,45 @@ load_breaks << 'BREAKS'
 # ── what the picker draws ────────────────────────
 
 @@ a note is drawn at the left edge | test_footer_note test_empty_list_note
--   cs_print_centered "$((row + 1))" "${text:0:width}" "${width}" "${CS_CLR_BELL}"
-+   printf '\e[%d;1H\e[K%b%s\e[0m' "$((row + 1))" "${CS_CLR_BELL}" "${text:0:width}"
+-     cs_print_centered "$((row + 1 + i))" "${rows[i]}" "${width}" "${CS_CLR_BELL}"
++     printf '\e[%d;1H\e[K%b%s\e[0m' "$((row + 1 + i))" "${CS_CLR_BELL}" "${rows[i]}"
 
-@@ a note is not cut to the pane | test_footer_note
--   cs_print_centered "$((row + 1))" "${text:0:width}" "${width}" "${CS_CLR_BELL}"
-+   cs_print_centered "$((row + 1))" "${text}" "${width}" "${CS_CLR_BELL}"
+@@ a long note is cut, not split | test_footer_note test_empty_list_note
+-   [[ -n "${rest}" ]] && _rows+=("${rest:0:width}")
+
+@@ a long note is split in the middle of a word | test_footer_note test_empty_list_note
+-   if [[ "${first}" == ?*" "* ]]; then
++   if false; then
+
+@@ the second row of a note is not cut to the pane | test_footer_note
+-   [[ -n "${rest}" ]] && _rows+=("${rest:0:width}")
++   [[ -n "${rest}" ]] && _rows+=("${rest}")
+
+@@ a pane with no columns is not given one | test_empty_list_note
+-   ((width > 0)) || width=1
 
 @@ a note has no empty row above it | test_footer_note test_empty_list_note
--   cs_print_centered "$((row + 1))" "${text:0:width}" "${width}" "${CS_CLR_BELL}"
-+   cs_print_centered "${row}" "${text:0:width}" "${width}" "${CS_CLR_BELL}"
+-     cs_print_centered "$((row + 1 + i))" "${rows[i]}" "${width}" "${CS_CLR_BELL}"
++     cs_print_centered "$((row + i))" "${rows[i]}" "${width}" "${CS_CLR_BELL}"
 
 @@ a note is drawn in the dim colour | test_footer_note
--   cs_print_centered "$((row + 1))" "${text:0:width}" "${width}" "${CS_CLR_BELL}"
-+   cs_print_centered "$((row + 1))" "${text:0:width}" "${width}"
+-     cs_print_centered "$((row + 1 + i))" "${rows[i]}" "${width}" "${CS_CLR_BELL}"
++     cs_print_centered "$((row + 1 + i))" "${rows[i]}" "${width}"
 
 @@ the version is drawn over the note | test_footer_note
--       version_line=$((quit_line + 4))
+-       version_line=$((quit_line + 3 + ${#note_rows[@]}))
 +       version_line=$((quit_line + 2))
 
+@@ the version is drawn over the row below a two-row note | test_footer_note
+-       version_line=$((quit_line + 3 + ${#note_rows[@]}))
++       version_line=$((quit_line + 4))
+
 @@ a full list keeps its rows when a note is shown | test_footer_note
--   [[ -n "${note}" ]] && avail=$((avail - 2))
+-   ((${#note_rows[@]})) && avail=$((avail - ${#note_rows[@]} - 1))
+
+@@ a full list gives a two-row note the rows of a one-row note | test_footer_note
+-   ((${#note_rows[@]})) && avail=$((avail - ${#note_rows[@]} - 1))
++   ((${#note_rows[@]})) && avail=$((avail - 2))
 
 @@ a failing poll is not shown as a note | test_footer_note
 -   ((SEARCH_ACTIVE)) || note="${POLL_ERROR:-${FOOTER_MSG}}"
@@ -477,7 +495,22 @@ load_breaks << 'BREAKS'
 +   note="${POLL_ERROR:-${FOOTER_MSG}}"
 
 @@ a command's line is not shown with an empty list | test_empty_list_note
--     cs_render_note 3 "${width}" "${FOOTER_MSG}" || true
+-     cs_render_note "${empty_note_row}" "${width}" "${FOOTER_MSG}" || true
+
+@@ an empty list has a text | test_empty_list_note
+-     local empty_msg=""
++     local empty_msg="No sessions. :c starts one"
+
+@@ a long failing poll with an empty list has no second row | test_empty_list_note
+-     if ((${#empty_rows[@]} > 1)); then
++     if false; then
+
+@@ the second row of a failing poll is not indented | test_empty_list_note
+-       printf '\e[3;1H%b  %s\e[0m' "${CS_CLR_CHROME}" "${empty_rows[1]}"
++       printf '\e[3;1H%b%s\e[0m' "${CS_CLR_CHROME}" "${empty_rows[1]}"
+
+@@ a note is drawn over the second row of a failing poll | test_empty_list_note
+-       empty_note_row=4
 
 # ── attention ────────────────────────────────────
 

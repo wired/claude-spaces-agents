@@ -219,8 +219,8 @@ cs_create_default_config() {
 # Picker pane width: characters (e.g. 30) or percentage (e.g. 20%)
 # picker_width=30
 
-# Sessions active within this many minutes sort at the top, by name; the rest
-# sort by most recent activity below them.
+# Sessions active within this many minutes sort at the top (the ones that are
+# not dim first, then by name); the rest sort by most recent activity below them.
 # recent_threshold=10
 
 # Picker pane position: "right" (default) or "left"
@@ -890,8 +890,9 @@ cs_sort_memo() {
   printf -v "${_out}" '%s' "${_so}"
 }
 
-# Sessions active within recent_threshold minutes first, by name; then the rest,
-# most recent first. Ended sessions (failed, stopped) always sort with the rest.
+# Sessions active within recent_threshold minutes first: the ones that are not
+# dim, then by name. Then the rest, most recent first. Ended sessions (failed,
+# stopped) always sort with the rest.
 cs_sort_entries() {
   local n=${#ENTRIES_ID[@]}
   local now
@@ -915,14 +916,17 @@ cs_sort_entries() {
     esac
   done
 
-  # Sort recent by name (case-insensitive); index first to handle spaces
+  # Sort recent by not-dim-first, then name (case-insensitive); index first to handle spaces
   local sorted_recent=""
   if ((${#recent_indices[@]} > 0)); then
-    local _rin=""
+    local _rin="" rank look
     for i in "${recent_indices[@]}"; do
-      _rin+="${_rin:+$'\n'}${i} ${ENTRIES_NAME[${i}],,}"
+      rank=1
+      cs_row_look look "${ENTRIES_ID[${i}]}" "${ENTRIES_STATUS[${i}]}"
+      [[ "${look}" != "dormant" ]] && rank=0
+      _rin+="${_rin:+$'\n'}${i} ${rank} ${ENTRIES_NAME[${i}],,}"
     done
-    cs_sort_memo sorted_recent recent "${_rin}" -t' ' -k2
+    cs_sort_memo sorted_recent recent "${_rin}" -t' ' -k2,2 -k3
   fi
 
   # Sort older by last activity, descending
@@ -1416,7 +1420,7 @@ cs_fingerprint() {
   local i
   for ((i = 0; i < ${#ENTRIES_ID[@]}; i++)); do
     _fpv+="${ENTRIES_ID[${i}]}:${ENTRIES_STATUS[${i}]}:${ENTRIES_MTIME[${i}]}:${ENTRIES_NAME[${i}]}:"
-    _fpv+="${UNSEEN_SET[${ENTRIES_ID[${i}]}]:-0}|"
+    _fpv+="${UNSEEN_SET[${ENTRIES_ID[${i}]}]:-0}:${AG_STATUS[${ENTRIES_ID[${i}]}]:+proc}|"
   done
   printf -v "${_out}" '%s' "${_fpv}"
 }
@@ -2182,14 +2186,41 @@ cs_switch_chain() {
 }
 
 # ── Jump Numbers ──────────────────────────────────
-# The first ten rows of this project, in display order.
+# Ten numbers for the session rows of every project, as in claude-spaces: the
+# rows that are not dim first, then the rest. The numbers run in display order.
 cs_compute_jump_slots() {
   JUMP_SLOT=()
   JUMP_TARGET=()
   ((SHOW_INDEX)) || return 0
-  local n=${#ENTRIES_ID[@]} i slot=1
+  local n=${#ENTRIES_ID[@]} i marked=0 look
+
+  # Pass 1: mark the rows that are not dim (guaranteed a slot)
+  for ((i = 0; i < n && marked < 10; i++)); do
+    case "${ENTRIES_TYPE[${i}]}" in
+      local|remote) ;;
+      *) continue ;;
+    esac
+    cs_row_look look "${ENTRIES_ID[${i}]}" "${ENTRIES_STATUS[${i}]}"
+    [[ "${look}" != "dormant" ]] || continue
+    JUMP_SLOT[${i}]=1
+    marked=$((marked + 1))
+  done
+
+  # Pass 2: fill the remaining marks with the dim rows, list order
+  for ((i = 0; i < n && marked < 10; i++)); do
+    [[ -v "JUMP_SLOT[${i}]" ]] && continue
+    case "${ENTRIES_TYPE[${i}]}" in
+      local|remote) ;;
+      *) continue ;;
+    esac
+    JUMP_SLOT[${i}]=1
+    marked=$((marked + 1))
+  done
+
+  # Pass 3: assign sequential numbers in display order
+  local slot=1
   for ((i = 0; i < n && slot <= 10; i++)); do
-    [[ "${ENTRIES_TYPE[${i}]}" == "local" ]] || continue
+    [[ -v "JUMP_SLOT[${i}]" ]] || continue
     JUMP_SLOT[${i}]=$((slot % 10))
     JUMP_TARGET[$((slot % 10))]=${i}
     slot=$((slot + 1))
@@ -2670,8 +2701,9 @@ cs_picker_render() {
             line_prefix="< "
           fi
         fi
-        if [[ "${entry_type}" == "remote" ]]; then
-          # another project's session: indented under its project, no jump number
+        if [[ "${entry_type}" == "remote" ]] && ((!SHOW_INDEX)); then
+          # another project's session: indented under its project. With
+          # show_index on, its number or the two blanks stand in for the indent.
           [[ -n "${line_prefix}" ]] || indent=2
         elif ((SHOW_INDEX)); then
           if [[ -v "JUMP_SLOT[${i}]" ]]; then
@@ -3092,8 +3124,14 @@ cs_activate_selected() {
   ((n == 0)) && return 0
   case "${ENTRIES_TYPE[${SELECTED}]}" in
     local) cs_show_session "${ENTRIES_ID[${SELECTED}]}" ;;
-    project) cs_switch_to_project "${ENTRIES_PATH[${SELECTED}]}" ;;
-    remote) cs_switch_to_project "${ENTRIES_PATH[${SELECTED}]}" "${ENTRIES_ID[${SELECTED}]}" ;;
+    project)
+      cs_switch_to_project "${ENTRIES_PATH[${SELECTED}]}"
+      cs_sync_highlight_local
+      ;;
+    remote)
+      cs_switch_to_project "${ENTRIES_PATH[${SELECTED}]}" "${ENTRIES_ID[${SELECTED}]}"
+      cs_sync_highlight_local
+      ;;
   esac
 }
 

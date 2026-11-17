@@ -16,7 +16,7 @@ terminal per session. Closing the view stops no session.
 |                                    |                              |
 +------------------------------------+      ─ other projects ─      |
 |                                    | webapp                       |
-|  that session's terminal           |   camera firmware         3h |
+|  that session's terminal           | 4 camera firmware         3h |
 |                                    |                              |
 |                                    | : menu  / search             |
 |                                    | Q:detach  ?:help             |

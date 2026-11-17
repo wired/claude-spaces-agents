@@ -332,12 +332,14 @@ Every row is selectable.
 The process is what tells a closed session from an open one. `claude stop` on an idle session
 leaves its state `done` and only takes the process away (§ Verified), so a row styled by state
 alone does not change when its session is stopped. Claude putting an idle session to sleep after
-an hour looks the same, and is the same thing.
+an hour looks the same, and is the same thing. The list is drawn again when a process comes or
+goes, even though the state is the same.
 
 Order and the age column work as in claude-spaces, on last activity (§ Last activity). Sessions
-active within `recent_threshold` minutes come first, sorted by name. The rest follow, most
-recent first; ended sessions always sort there. `startedAt` is not used for order: it is the
-process start and moves when a session is woken.
+active within `recent_threshold` minutes come first: the ones that are not dim, then by name, as
+claude-spaces puts its running sessions first. The rest follow, most recent first; ended
+sessions always sort there. `startedAt` is not used for order: it is the process start and moves
+when a session is woken.
 
 ### Attention
 
@@ -365,14 +367,15 @@ and `client-focus-out` hooks stay: they tell the picker whether the terminal win
 ### Other projects
 
 Every other project that has listed sessions: a project row, then its sessions indented, most
-recent first. The session rows are styled as in this project. They get no jump numbers. Project
-names are disambiguated as in claude-spaces, and a custom project name wins.
+recent first. The session rows are styled as in this project and take jump numbers like them
+(§ Actions): the number stands where the indent was. Project rows take none. Project names are
+disambiguated as in claude-spaces, and a custom project name wins.
 
 Selecting a project or one of its sessions hops to that project's server. The picker writes
-`switch_target` with the project path and, for a session, its `id`, then detaches. The launcher
-changes directory, initializes the target's state, and only then writes `pending_load`. Writing
-it earlier would lose it: state initialization wipes the directory of a server that is not
-running.
+`switch_target` with the project path and, for a session, its `id`, then detaches. The view that
+is left keeps running, and its cursor goes back to the session it shows. The launcher changes
+directory, initializes the target's state, and only then writes `pending_load`. Writing it
+earlier would lose it: state initialization wipes the directory of a server that is not running.
 
 There is no inactive section. To work in a folder that has no sessions, run
 `claude-spaces-agents` there.
@@ -414,8 +417,10 @@ terminal keys, rename project, detach, reload, config).
     two rows by the same rule. The command's message is drawn as a note under that: its first
     row is the fourth of the pane, or the fifth under a failing poll on two rows.
   - The search view shows no note.
-- **Jump numbers** go to the first ten rows of this project, in display order. claude-spaces
-  gave the first slots to running sessions, a distinction that no longer exists.
+- **Jump numbers** go to session rows, of this project and of the others, as in claude-spaces.
+  There are ten. Rows that are not dim get theirs first, whatever their project; dim rows fill
+  what is left, in list order. The numbers themselves run in display order, `1` to `9`, then
+  `0`. A number on another project's session hops there, as `Enter` on its row does.
 - **`Workspace not trusted`.** `claude --bg` has no terminal and cannot ask about a directory
   never opened before: it fails and starts nothing. The picker opens agent view in the client
   pane, which shows Claude's trust dialog. The dialog says what the message would, so the

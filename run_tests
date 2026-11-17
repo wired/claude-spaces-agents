@@ -798,8 +798,9 @@ test_poll_failure_keeps_list() {
   assert_eq "error after recovery" "${POLL_ERROR}" ""
 }
 
-# Recent sessions by name, then the rest by last activity; ended ones never sort
-# as recent. A session with no prompt yet is named for what it is.
+# Recent sessions first: the ones that are not dim, then by name. Then the rest
+# by last activity; ended ones never sort as recent. A session with no prompt
+# yet is named for what it is.
 test_order_and_names() {
   local now
   now=$(date +%s)
@@ -809,17 +810,21 @@ test_order_and_names() {
   fake_add aaaaaaa4 done idle "eta"
   fake_add aaaaaaa5 failed "" "aaa"
   fake_add aaaaaaa6 blocked idle "aaaaaaa6"
+  fake_add aaaaaaa7 done "" "Aardvark"
   fake_transcript aaaaaaa1 $((now - 60))
   fake_transcript aaaaaaa2 $((now - 120))
   fake_transcript aaaaaaa3 $((now - 3600))
   fake_transcript aaaaaaa4 $((now - 7200))
   fake_transcript aaaaaaa5 $((now - 30))
+  fake_transcript aaaaaaa7 $((now - 90))
   cs_poll 1 || { fail "poll failed"; return 1; }
   cs_rescan
   local names
   names=$(printf '%s|' "${ENTRIES_NAME[@]}")
+  # Aardvark is recent but was stopped while idle: it has no process, so it comes
+  # after the recent ones that have one, whatever its name.
   # the promptless one has no transcript: it sorts by when it started, long ago
-  assert_eq "order" "${names}" "Alpha|beta|aaa (failed)|zeta|eta|(new session)|"
+  assert_eq "order" "${names}" "Alpha|beta|Aardvark|aaa (failed)|zeta|eta|(new session)|"
 }
 
 # Other projects come after this one: a header, then each project with its
@@ -849,8 +854,10 @@ test_other_projects_rows() {
   assert_eq "a remote row carries its project path" "${ENTRIES_PATH[${idx}]}" "/work/client-a/api"
 }
 
-# Jump numbers go to the first ten rows of this project, in display order, and to
-# nothing else.
+# Jump numbers go to session rows, of this project and of the others, and to
+# nothing else. With more sessions than numbers, the rows that are not dim come
+# first, whatever their project, and dim rows fill what is left in list order.
+# The numbers themselves always run in display order.
 test_jump_slots() {
   local i idx
   for i in 1 2 3; do
@@ -860,24 +867,91 @@ test_jump_slots() {
   cs_poll 1 || { fail "poll failed"; return 1; }
   cs_rescan
   cs_compute_jump_slots
-  # slots are left over here, and still none goes to another project's rows
-  assert_eq "slots with three sessions" "${#JUMP_SLOT[@]}" "3" || return 1
-  cs_find_entry_index bbbbbbb1 idx
-  [[ ! -v "JUMP_SLOT[${idx}]" ]] || { fail "another project's row got a jump number"; return 1; }
-
-  for i in 4 5 6 7 8 9 a b c; do
-    fake_add "aaaaaaa${i}" done idle "session ${i}"
+  for ((i = 0; i < ${#ENTRIES_ID[@]}; i++)); do
+    case "${ENTRIES_TYPE[${i}]}" in
+      local|remote) ;;
+      *) [[ ! -v "JUMP_SLOT[${i}]" ]] || { fail "a ${ENTRIES_TYPE[${i}]} row got a jump number"; return 1; } ;;
+    esac
   done
+  assert_eq "slots with four sessions" "${#JUMP_SLOT[@]}" "4" || return 1
+  cs_find_entry_index bbbbbbb1 idx
+  assert_eq "another project's session, after this project's" "${JUMP_SLOT[${idx}]:-none}" "4" || return 1
+  assert_eq "key 4 goes to it" "${JUMP_TARGET[4]:-none}" "${idx}" || return 1
+
+  # More sessions than numbers: thirteen here, three of them not dim, and two in
+  # the other project, one of them not dim.
+  for i in 4 5 6 7 8 9 a b c d; do
+    fake_add "aaaaaaa${i}" done "" "asleep ${i}"
+  done
+  fake_add bbbbbbb2 done "" "asleep theirs" "/work/other"
   cs_poll 1 || { fail "second poll failed"; return 1; }
   cs_rescan
   cs_compute_jump_slots
   assert_eq "slots given" "${#JUMP_SLOT[@]}" "10" || return 1
-  assert_eq "first row" "${JUMP_SLOT[0]}" "1" || return 1
-  assert_eq "tenth row is 0" "${JUMP_SLOT[9]}" "0" || return 1
-  assert_eq "key 0 goes to the tenth row" "${JUMP_TARGET[0]}" "9" || return 1
+  # Down the list: every row that is not dim has a number, and so do the first
+  # six dim ones. The numbers go 1 to 9, then 0.
+  local dim=0 want=1
+  for ((i = 0; i < ${#ENTRIES_ID[@]}; i++)); do
+    case "${ENTRIES_TYPE[${i}]}" in
+      local|remote) ;;
+      *) continue ;;
+    esac
+    if [[ "${ENTRIES_NAME[${i}]}" == asleep* ]]; then
+      dim=$((dim + 1))
+      if ((dim > 6)); then
+        [[ ! -v "JUMP_SLOT[${i}]" ]] || { fail "dim row ${dim}, '${ENTRIES_NAME[${i}]}', got a jump number"; return 1; }
+        continue
+      fi
+    fi
+    assert_eq "number of '${ENTRIES_NAME[${i}]}'" "${JUMP_SLOT[${i}]:-none}" "$((want % 10))" || return 1
+    assert_eq "key $((want % 10))" "${JUMP_TARGET[$((want % 10))]:-none}" "${i}" || return 1
+    want=$((want + 1))
+  done
+  cs_find_entry_index bbbbbbb1 idx
+  assert_eq "not dim, below thirteen rows of this project" "${JUMP_SLOT[${idx}]:-none}" "0" || return 1
+
   SHOW_INDEX=0
   cs_compute_jump_slots
   assert_eq "slots with show_index off" "${#JUMP_SLOT[@]}" "0"
+}
+
+# On the screen, another project's session carries its number where its indent
+# was. With show_index off there are no numbers and the indent is back.
+test_jump_numbers_drawn() {
+  local now
+  now=$(date +%s)
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done idle "beta"
+  fake_add bbbbbbb1 done idle "theirs" "/work/other"
+  fake_transcript aaaaaaa1 $((now - 7200))
+  fake_transcript aaaaaaa2 $((now - 10800))
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  local -a row
+  # 1 header, 2-3 this project, 4 empty, 5 "other projects", 6 the project, 7 its session
+  screen_rows 40 20
+  [[ "${row[2]}" == "1 alpha "* ]] || { fail "this project's first row: '${row[2]}'"; return 1; }
+  [[ "${row[3]}" == "2 beta "* ]] || { fail "this project's second row: '${row[3]}'"; return 1; }
+  assert_eq "the project row has no number" "${row[6]}" "other" || return 1
+  assert_eq "another project's session" "${row[7]}" "3 theirs" || return 1
+
+  SHOW_INDEX=0
+  screen_rows 40 20
+  [[ "${row[2]}" == "alpha "* ]] || { fail "show_index off, this project's first row: '${row[2]}'"; return 1; }
+  assert_eq "show_index off, another project's session" "${row[7]}" "  theirs"
+}
+
+# A digit on another project's session hops there, as Enter on its row does. A
+# digit with no row behind it does nothing.
+test_jump_key_hops() {
+  fake_add aaaaaaa1 done idle "mine"
+  fake_add bbbbbbb1 done idle "theirs" "/work/other"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  cs_jump_to_session 7
+  [[ ! -f "${STATE_DIR}/switch_target" ]] || { fail "a digit with no row behind it hopped"; return 1; }
+  cs_jump_to_session 2
+  assert_eq "switch_target" "$(cat "${STATE_DIR}/switch_target" 2>/dev/null)" $'/work/other\nbbbbbbb1'
 }
 
 # How a row looks. A session with no process is dim: `claude stop` on an idle
@@ -911,6 +985,23 @@ test_row_look() {
   SHOWN="aaaaaaa2"
   cs_row_look got aaaaaaa2 done
   assert_eq "the shown session" "${got}" "active"
+}
+
+# The list is drawn again when a session's process comes or goes while its state
+# stays the same. That is what makes a row dim, and what its jump number goes by.
+test_fingerprint_sees_process() {
+  local before after
+  fake_add aaaaaaa1 done idle "one"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  cs_fingerprint before 1
+  fake_set aaaaaaa1 done ""
+  cs_poll 1 || { fail "second poll failed"; return 1; }
+  cs_rescan
+  assert_eq "the state is the same" "${AG_STATE[aaaaaaa1]}" "done" || return 1
+  assert_eq "the process is gone" "${AG_STATUS[aaaaaaa1]:-}" "" || return 1
+  cs_fingerprint after 1
+  [[ "${after}" != "${before}" ]] || { fail "the fingerprint is the same with and without a process"; return 1; }
 }
 
 # The check that runs after every test, tested: it has to notice each kind of
@@ -1724,23 +1815,29 @@ test_seen_sweep() {
 # Selecting another project, or one of its sessions, leaves the launcher a
 # switch_target: the project path, then the session to show there.
 test_hop_writes_switch_target() {
+  fake_add aaaaaaa1 done idle "mine"
+  fake_add aaaaaaa2 done idle "mine, shown"
   fake_add bbbbbbb1 done idle "theirs" "/work/other"
   cs_poll 1 || { fail "poll failed"; return 1; }
   cs_rescan
+  cs_show_session aaaaaaa2 || { fail "setup failed"; return 1; }
   local idx
   cs_find_entry_index bbbbbbb1 idx
   SELECTED=${idx}
   cs_activate_selected
   assert_eq "for a session" "$(cat "${STATE_DIR}/switch_target")" $'/work/other\nbbbbbbb1' || return 1
   [[ ! -f "${STATE_DIR}/pending_load" ]] || { fail "the picker wrote pending_load itself"; return 1; }
-  assert_eq "nothing shown here" "${SHOWN}" "" || return 1
+  assert_eq "what is shown here stays" "${SHOWN}" "aaaaaaa2" || return 1
+  # the view that is left keeps running: its cursor goes back to what it shows
+  assert_eq "the cursor after a hop from a session" "${ENTRIES_ID[${SELECTED}]}" "aaaaaaa2" || return 1
 
   rm -f "${STATE_DIR}/switch_target"
   SELECTED=$((idx - 1))
   assert_eq "the row above is the project" "${ENTRIES_TYPE[${SELECTED}]}" "project" || return 1
   cs_activate_selected
   assert_eq "for a project" "$(sed -n 1p "${STATE_DIR}/switch_target")" "/work/other" || return 1
-  assert_eq "a project names no session" "$(sed -n 2p "${STATE_DIR}/switch_target")" ""
+  assert_eq "a project names no session" "$(sed -n 2p "${STATE_DIR}/switch_target")" "" || return 1
+  assert_eq "the cursor after a hop from a project" "${ENTRIES_ID[${SELECTED}]}" "aaaaaaa2"
 }
 
 # A session the launcher left in pending_load is shown, once, if it is this
@@ -2793,7 +2890,10 @@ main() {
   run_test "order and names"                test_order_and_names
   run_test "other projects rows"            test_other_projects_rows
   run_test "jump slots"                     test_jump_slots
+  run_test "jump numbers drawn"             test_jump_numbers_drawn
+  run_test "jump key hops"                  test_jump_key_hops
   run_test "row look"                       test_row_look
+  run_test "fingerprint sees process"       test_fingerprint_sees_process
 
   run_test "invariant check notices"        test_invariant_check_notices
 

@@ -265,6 +265,10 @@ load_breaks << 'BREAKS'
 +       failed|stopped)
 +         recent_indices+=("${i}")
 
+@@ a recent session with no process sorts among the ones that have one | test_order_and_names
+-       [[ "${look}" != "dormant" ]] && rank=0
++       rank=0
+
 @@ a promptless session is shown by its id | test_order_and_names
 -       _rf_name="(new session)"
 +       _rf_name="${_rf_id}"
@@ -277,9 +281,38 @@ load_breaks << 'BREAKS'
 -     leaf="${PROJECT_NAMES[${sanitized}]:-${DISPLAY_NAMES[${proj}]:-${proj##*/}}}"
 +     leaf="${DISPLAY_NAMES[${proj}]:-${proj##*/}}"
 
-@@ jump numbers go to any row | test_jump_slots
--     [[ "${ENTRIES_TYPE[${i}]}" == "local" ]] || continue
-+     [[ "${ENTRIES_TYPE[${i}]}" != "spacer" ]] || continue
+@@ another project's sessions get no jump number | test_jump_slots test_jump_numbers_drawn test_jump_key_hops
+-       local|remote) ;;
+-       *) continue ;;
+-     esac
+-     cs_row_look look "${ENTRIES_ID[${i}]}" "${ENTRIES_STATUS[${i}]}"
++       local) ;;
++       *) continue ;;
++     esac
++     cs_row_look look "${ENTRIES_ID[${i}]}" "${ENTRIES_STATUS[${i}]}"
+&&
+-       local|remote) ;;
+-       *) continue ;;
+-     esac
+-     JUMP_SLOT[${i}]=1
++       local) ;;
++       *) continue ;;
++     esac
++     JUMP_SLOT[${i}]=1
+
+@@ a project row gets a jump number | test_jump_slots test_jump_numbers_drawn
+-       local|remote) ;;
+-       *) continue ;;
+-     esac
+-     JUMP_SLOT[${i}]=1
++       local|remote|project) ;;
++       *) continue ;;
++     esac
++     JUMP_SLOT[${i}]=1
+
+@@ rows that are not dim get no number ahead of the dim ones | test_jump_slots
+-     [[ "${look}" != "dormant" ]] || continue
++     continue
 
 @@ only stopped and failed sessions are dim | test_row_look test_stop_shows_feedback
 -   elif [[ "${status}" != "working" && -z "${AG_STATUS[${id}]:-}" ]]; then
@@ -454,6 +487,18 @@ load_breaks << 'BREAKS'
 
 # ── what the picker draws ────────────────────────
 
+@@ another project's session keeps its indent next to a number | test_jump_numbers_drawn
+-         if [[ "${entry_type}" == "remote" ]] && ((!SHOW_INDEX)); then
++         if [[ "${entry_type}" == "remote" ]]; then
+
+@@ another project's session is not indented with show_index off | test_jump_numbers_drawn
+-           [[ -n "${line_prefix}" ]] || indent=2
++           :
+
+@@ a process that goes away does not redraw the list | test_fingerprint_sees_process
+-     _fpv+="${UNSEEN_SET[${ENTRIES_ID[${i}]}]:-0}:${AG_STATUS[${ENTRIES_ID[${i}]}]:+proc}|"
++     _fpv+="${UNSEEN_SET[${ENTRIES_ID[${i}]}]:-0}|"
+
 @@ a note is drawn at the left edge | test_footer_note test_empty_list_note
 -     cs_print_centered "$((row + 1 + i))" "${rows[i]}" "${width}" "${CS_CLR_BELL}"
 +     printf '\e[%d;1H\e[K%b%s\e[0m' "$((row + 1 + i))" "${CS_CLR_BELL}" "${rows[i]}"
@@ -564,7 +609,23 @@ load_breaks << 'BREAKS'
 +   printf '%s\n' "${target_path}" > "${STATE_DIR}/switch_target"
 
 @@ selecting another project's session does nothing | test_hop_writes_switch_target
--     remote) cs_switch_to_project "${ENTRIES_PATH[${SELECTED}]}" "${ENTRIES_ID[${SELECTED}]}" ;;
+-     remote)
+-       cs_switch_to_project "${ENTRIES_PATH[${SELECTED}]}" "${ENTRIES_ID[${SELECTED}]}"
+-       cs_sync_highlight_local
+-       ;;
+
+@@ the cursor stays on another project's session after a hop | test_hop_writes_switch_target
+-       cs_switch_to_project "${ENTRIES_PATH[${SELECTED}]}" "${ENTRIES_ID[${SELECTED}]}"
+-       cs_sync_highlight_local
++       cs_switch_to_project "${ENTRIES_PATH[${SELECTED}]}" "${ENTRIES_ID[${SELECTED}]}"
+
+@@ the cursor stays on a project row after a hop | test_hop_writes_switch_target
+-       cs_switch_to_project "${ENTRIES_PATH[${SELECTED}]}"
+-       cs_sync_highlight_local
++       cs_switch_to_project "${ENTRIES_PATH[${SELECTED}]}"
+
+@@ a digit acts on the cursor row, not on its own | test_jump_key_hops
+-   SELECTED=${JUMP_TARGET[${target}]}
 
 @@ a hop can show another project's session here | test_pending_load_shows_session
 -   [[ "${idx}" != "-1" && "${ENTRIES_TYPE[${idx}]}" == "local" ]] || return 0

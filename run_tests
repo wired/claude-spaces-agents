@@ -1311,16 +1311,25 @@ FAKE
 }
 
 # `claude --bg` cannot ask about an untrusted directory: it has no terminal. The
-# picker opens agent view, which shows Claude's trust dialog.
+# picker opens agent view, which shows Claude's trust dialog, and leaves no
+# message beside it. The message stays when agent view could not be opened.
 test_new_session_untrusted_opens_agents() {
   touch "${FAKE_CLAUDE_DIR}/untrusted" "${FAKE_CLAUDE_DIR}/slow_agents"
   local rc=0
   cs_new_session || rc=$?
   assert_eq "result" "${rc}" "1" || return 1
-  [[ "${FOOTER_MSG}" == "Workspace not trusted"* ]] || { fail "footer: '${FOOTER_MSG}'"; return 1; }
   assert_eq "client title" "$(client_title)" "${CS_T_AGENTS}" || return 1
   wait_for "${FAKE_CLAUDE_DIR}/attach.log" || { fail "agent view never ran"; return 1; }
-  assert_eq "what ran" "$(tail -1 "${FAKE_CLAUDE_DIR}/attach.log")" "agents"
+  assert_eq "what ran" "$(tail -1 "${FAKE_CLAUDE_DIR}/attach.log")" "agents" || return 1
+  assert_eq "footer" "${FOOTER_MSG}" "" || return 1
+
+  # a client pane that is gone cannot be given the dialog
+  _tmux kill-pane -t "${CLIENT_PANE}"
+  rc=0
+  cs_new_session || rc=$?
+  assert_eq "no agent view: result" "${rc}" "1" || return 1
+  [[ "${FOOTER_MSG}" == "Workspace not trusted"* ]] || { fail "no agent view: footer: '${FOOTER_MSG}'"; return 1; }
+  assert_eq "no agent view: client title" "$(client_title)" "${CS_T_WELCOME}"
 }
 
 # A new session nobody typed into is removed when the user moves on. One that got

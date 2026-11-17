@@ -398,8 +398,8 @@ terminal keys, rename project, detach, reload, config).
   left on. With nothing shown, or from the picker itself, they act on the cursor row. The list
   is drawn again before the question, so the row asked about is the one highlighted.
 - **Command output is shown.** A command's message goes to the picker's footer, on success as
-  well as on failure. Known failures: `Workspace not trusted` from `claude --bg` in a directory
-  never opened before, and `kept <id>` with a reason from `claude rm`.
+  well as on failure. A known failure is `kept <id>` with a reason from `claude rm`. The one
+  message that is not shown is `Workspace not trusted` from `claude --bg` (below).
 - **Where it is shown.** A note is a failing poll, or else the last command's message. It has
   rows of its own between the key hints and the version: centered, in the bell colour, with an
   empty row above and below. The version stays, below it. A command's message goes away at the
@@ -416,8 +416,11 @@ terminal keys, rename project, detach, reload, config).
   - The search view shows no note.
 - **Jump numbers** go to the first ten rows of this project, in display order. claude-spaces
   gave the first slots to running sessions, a distinction that no longer exists.
-- **`Workspace not trusted`.** The picker also opens agent view in the client pane, which shows
-  Claude's trust dialog. The action is then repeated by hand.
+- **`Workspace not trusted`.** `claude --bg` has no terminal and cannot ask about a directory
+  never opened before: it fails and starts nothing. The picker opens agent view in the client
+  pane, which shows Claude's trust dialog. The dialog says what the message would, so the
+  message is not shown. It is shown only when agent view could not be opened. The action is
+  then repeated by hand.
 - **Waiting for a new `id`.** After a new session the picker refreshes until the new `id` is
   listed, for at most 5 seconds. Then it switches to it or reports the failure. The `id` is
   taken from the first line of the command's output, `backgrounded · <id>`. If that line is

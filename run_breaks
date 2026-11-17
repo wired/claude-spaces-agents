@@ -381,6 +381,10 @@ load_breaks << 'BREAKS'
 -         if [[ "${AG_CWD[${found}]%%/.claude/worktrees/*}" == "${PWD}" && "${found}" != "${DISPLAYED}" ]]; then
 +         if [[ "${found}" != "${DISPLAYED}" ]]; then
 
+@@ a status glyph before a session's name is left on | test_follow_title_mapping test_reload_keeps_shown
+-         "✳ "*|"◐ "*|"◑ "*) title="${title#* }" ;;
++         "✳ "*|"◐ "*|"◑ "*) ;;
+
 @@ agent view is marked as an exit | test_agents_view_keeps_displayed
 -   if cs_client_respawn "${CS_T_AGENTS}" "${STATE_DIR}/client.sh agents"; then
 +   if cs_client_respawn "${CS_T_WELCOME}" "${STATE_DIR}/client.sh agents"; then

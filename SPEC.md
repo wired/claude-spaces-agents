@@ -133,7 +133,7 @@ welcome screen. It runs one of:
 | Content | Command | Pane title |
 |---|---|---|
 | Welcome | help screen, then `sleep` | the welcome marker |
-| Session | `claude attach <id>` | the switching marker; the session's `name` only once it is opened from agent view |
+| Session | `claude attach <id>` | the switching marker; the session's `name` once it is opened from agent view; `✳` and the name when the session was attached in the middle of a tool call |
 | Agent view | `claude agents` | the agent-view marker, then `claude agents` or `N awaiting input · claude agents` |
 
 **Every respawn of the client pane goes through one helper, which sets a marker title in the same
@@ -171,7 +171,9 @@ Two values, kept apart:
 
 - The Focused and Active highlight follows `shown`.
 - A switch sets `shown` to the same session as `displayed`. The title cannot do it: after a
-  switch it is the switching marker, which leaves `shown` unchanged.
+  switch it is the switching marker, which leaves `shown` unchanged. A session attached in the
+  middle of a tool call replaces the marker with its own title, which names that same session
+  (§ Following the client).
 - At startup, which includes a reload, `shown` starts as `displayed` when the title is the
   switching marker. Otherwise it is taken from the title.
 - Terminal keys act on `displayed`, also while the client is in agent view. They do nothing when
@@ -281,14 +283,26 @@ client pane and sets `shown`:
 | the agent-view marker | nothing: agent view is starting |
 | `claude agents`, or ends with ` · claude agents` | nothing: agent view |
 | equals the `name` of exactly one listed session | that session |
+| `✳`, `◐` or `◑` and a space, then the `name` of exactly one listed session | that session |
 | anything else, or several matches | unchanged |
 
 What sets the title, as measured:
 
-- `claude attach <id>` itself sets no title. After a switch the marker stays, and `shown` keeps
-  what the picker set.
+- `claude attach <id>` itself sets no title. After a switch to a session that is not in a tool
+  call the marker stays, and `shown` keeps what the picker set.
 - Opening a session from inside agent view sets the title to its `name` at once. A session with
   no prompt yet gets `current session`.
+- A session that is in the middle of a tool call when a client becomes its only viewer sets its
+  own title: `✳` and its name. After a switch it comes about 0.2 s later and replaces the
+  marker. After an open from agent view it replaces the bare name within 0.1 s, so a scan once
+  a second does not see the bare name.
+- An idle session sets no title of its own. Neither does one that already has another viewer,
+  nor one reopened from agent view by the client that came from it. After a switch, a session
+  that is streaming text or has only a background shell sets none either; those two were not
+  measured from agent view.
+- The text behind the glyph is the session's own title. It was its `name` in every session
+  measured. `◐` and `◑` are the frames Claude's code has for a working session outside a
+  terminal multiplexer. They were not seen under tmux.
 - Agent view sets `claude agents` or `N awaiting input · claude agents`.
 - Other strings pass through, such as a terminal capability query that tmux records as a title.
   An unknown title must never be given a meaning.
@@ -634,8 +648,9 @@ Same harness as claude-spaces: an isolated tmux server and the script's function
 to the entrypoint marker. Claude is replaced by a fake `claude` on `PATH`:
 
 - `agents --json --all` prints a fixture file.
-- `attach <id>` records every SIGWINCH to a file and sleeps. Like the real one, it sets no title.
-  Tests set the pane title themselves to simulate agent view and a session opened from it.
+- `attach <id>` records every SIGWINCH to a file and sleeps. Like the real one on a session that
+  is not in a tool call, it sets no title. Tests set the pane title themselves to simulate agent
+  view, a session opened from it, and a session's own title.
 - `--bg`, `stop` and `rm` edit the fixture.
 - Transcripts are fixture files as well, so last activity, the age column and Finished, unseen
   can be tested, including a housekeeping record appended after the last turn.

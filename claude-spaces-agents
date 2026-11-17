@@ -1625,8 +1625,13 @@ cs_follow() {
       SHOWN=""
       ;;
     *)
-      # A session opened from agent view carries its name as title. Anything else,
-      # or a name two sessions share, means nothing: leave shown as it is.
+      # A session opened from agent view carries its name as title. One that is
+      # attached in the middle of a tool call sets its own title right after: the
+      # name behind a status glyph. Anything else, or a name two sessions share,
+      # means nothing: leave shown as it is.
+      case "${title}" in
+        "✳ "*|"◐ "*|"◑ "*) title="${title#* }" ;;
+      esac
       local id found="" count=0
       for id in "${AG_IDS[@]}"; do
         if [[ "${AG_NAME[${id}]}" == "${title}" ]]; then

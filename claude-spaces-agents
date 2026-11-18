@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════
 # claude-spaces-agents — tmux picker for Claude Code background sessions
-# Version 0.1.0-dev
+# Version 0.2.0-dev
 #
 # Copyright (c) 2026 Alex Alexander <alex.alexander@gmail.com>
 # Licensed under MIT
@@ -22,7 +22,7 @@ if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); 
   exit 1
 fi
 
-VERSION="0.1.0-dev"
+VERSION="0.2.0-dev"
 _cs_realpath() {
   local p="$1"
   local dir

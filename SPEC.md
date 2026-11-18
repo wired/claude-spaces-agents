@@ -25,7 +25,7 @@ loses no session. It does kill the terminals and whatever runs in them.
 |---|---|
 | Separate script `claude-spaces-agents`, forked from claude-spaces | The change replaces the core layers (pane lifecycle, discovery, bells), not the edges. A mode flag would branch all of them and double the test matrix. It also keeps a research-preview dependency out of claude-spaces. |
 | Its own repository | The two tools have separate versions, and tags belong to a repository, not to a script. In one repository every claude-spaces release tarball would also carry this script. Functions keep the `cs_` prefix and variables `CS_`, so fixes port between the two scripts by hand. || Agents-only list | Source of truth is `claude agents --json --all`, background entries only. Interactive sessions are not listed. No transcript scan, no name resolution, no hidden list. Older conversations are reached with `/resume` in agent view. |
-| One tmux server per project | Same as claude-spaces: launcher, server naming and state layout carry over, new sessions start in `$PWD`, and two terminals on two projects stay independent. A single global server would mirror every attached terminal. |
+| One tmux server per project | Same as claude-spaces: launcher, server naming and state layout carry over, new sessions start in `$PWD`, and two terminals on two projects stay independent. A single global server would mirror every attached terminal. Shutdown is the one command that reaches every server (§ Actions). |
 | One client pane per server | The pane runs `claude attach <id>`; switching respawns it. No per-session Claude windows and no picker fillers. |
 | `←` stays enabled | It cannot be disabled for an attached client without disabling the feature. The picker follows what the client shows instead. |
 | Claude's default worktree isolation is supported | Sessions under `<project>/.claude/worktrees/` belong to `<project>`. Removal goes through `claude rm`, which deletes the worktree when safe. With isolation on, a session that finishes commits, pushes its own branch and opens a draft pull request without asking. `worktree.bgIsolation: none` turns isolation off. |
@@ -311,8 +311,8 @@ When `shown` becomes another session of this project, the picker adopts it: `dis
 that session and the terminals are exchanged in place. That costs the new session one resize,
 which is unavoidable because the attach already happened.
 
-A session of another project can be opened this way too. Its row is highlighted in the other
-projects section; `displayed` and the terminal stay as they are.
+A session of another project can be opened this way too. Its row is highlighted under its own
+project; `displayed` and the terminal stay as they are.
 
 This is a heuristic. Names are not unique (a fork keeps its source's name), a session with no
 prompt yet cannot be followed, and the behaviour is undocumented. If it proves unreliable, the
@@ -321,15 +321,45 @@ the picker.
 
 ## Session list
 
-One unscoped `claude agents --json --all` call feeds every section. Only `kind: background`
+One unscoped `claude agents --json --all` call feeds the whole list. Only `kind: background`
 entries are listed. `--cwd` is not used for filtering: it is a prefix match, so nested projects
 would list each other's sessions.
 
 **Project of an entry**: its `cwd`, with a trailing `/.claude/worktrees/<name>…` removed.
 
-### This project
+### Projects
 
-Entries whose project equals `$PWD`. The first matching row wins:
+The list is the same in every project's picker. It holds every project that has listed
+sessions, and the picker's own project even when it has none. Each is a project row, then its
+sessions, with an empty row between two projects. The picker's own project has no place of its
+own, and no line sets the others apart.
+
+This is not how claude-spaces does it: there the picker's own project comes first. With one
+terminal window and hops between projects, that order changed at every hop.
+
+- **Order.** A project is recent when one of its sessions sorts as recent (§ Session rows).
+  Recent projects come first, by name without regard to case, then by path. The rest follow by
+  their most recent activity, then by name, then by path. Recent projects are not sorted by
+  activity: two projects with a working session each would change places at every poll.
+- **The picker's own project** is the row in bold. It is the project a prefix key pressed from
+  another pane acts on (§ Actions). While it has no session it is listed as recent, which is
+  where its first session will put it. So the list is never empty.
+- **Names** are disambiguated as in claude-spaces, and a custom project name wins.
+- **Nothing a picker has of its own decides the order**: not `$PWD`, not the cursor. The rows
+  come from Claude's list, the transcripts and the shared `seen/` files. `shown` is the one
+  exception, and a short one: it makes a row not dim, so a session shown here whose new process
+  is not listed yet sorts as not dim in this picker only, until the next poll.
+
+- **The cursor never rests on the empty row between two projects.** When the row under it goes
+  away and the empty row is what takes its place, the cursor goes up to the row before: the
+  last session left in that project, or its project row.
+
+There is no inactive section. To work in a folder that has no sessions, run
+`claude-spaces-agents` there.
+
+### Session rows
+
+A session row is styled the same in every project. The first matching row wins:
 
 | Row | Source | Style |
 |---|---|---|
@@ -349,11 +379,14 @@ alone does not change when its session is stopped. Claude putting an idle sessio
 an hour looks the same, and is the same thing. The list is drawn again when a process comes or
 goes, even though the state is the same.
 
-Order and the age column work as in claude-spaces, on last activity (§ Last activity). Sessions
-active within `recent_threshold` minutes come first: the ones that are not dim, then by name, as
-claude-spaces puts its running sessions first. The rest follow, most recent first; ended
-sessions always sort there. `startedAt` is not used for order: it is the process start and moves
-when a session is woken.
+Order and the age column work as in claude-spaces, on last activity (§ Last activity), within
+each project. Sessions active within `recent_threshold` minutes come first: the ones that are
+not dim, then by name, as claude-spaces puts its running sessions first. The rest follow, most
+recent first; ended sessions always sort there. `startedAt` is not used for order: it is the
+process start and moves when a session is woken.
+
+A session row takes a jump number (§ Actions). With `show_index` off it is indented under its
+project instead.
 
 ### Attention
 
@@ -380,19 +413,20 @@ and `client-focus-out` hooks stay: they tell the picker whether the terminal win
 
 ### Other projects
 
-Every other project that has listed sessions: a project row, then its sessions indented, most
-recent first. The session rows are styled as in this project and take jump numbers like them
-(§ Actions): the number stands where the indent was. Project rows take none. Project names are
-disambiguated as in claude-spaces, and a custom project name wins.
+Selecting another project's row or one of its sessions hops to that project's server. The picker
+writes `switch_target` with the project path and what to do there, then detaches. What to do is
+a session's `id`, or `new` or `agents` for a command (§ Actions), or nothing for a project row.
 
-Selecting a project or one of its sessions hops to that project's server. The picker writes
-`switch_target` with the project path and, for a session, its `id`, then detaches. The view that
-is left keeps running, and its cursor goes back to the session it shows. The launcher changes
-directory, initializes the target's state, and only then writes `pending_load`. Writing it
-earlier would lose it: state initialization wipes the directory of a server that is not running.
+The view that is left keeps running, and its cursor goes back to the session it shows. With
+nothing shown it goes to its own project's first session, or to that project's row when it has
+none: its own project need not be at the top of the list.
 
-There is no inactive section. To work in a folder that has no sessions, run
-`claude-spaces-agents` there.
+The launcher changes directory, initializes the target's state, and only then writes
+`pending_load`. Writing it earlier would lose it: state initialization wipes the directory of a
+server that is not running. The target's picker reads it at startup or on its next scan. A
+picker that does not know a value drops it: `new` is not an `id`.
+
+Enter on the picker's own project row does nothing. There is nowhere to hop.
 
 ## Actions
 
@@ -402,39 +436,63 @@ terminal keys, rename project, detach, reload, config).
 | Action | Key (proposed) | What it does |
 |---|---|---|
 | Show | `Enter`, `Space` | switch to the session; `Enter` also focuses it |
-| New session | `:c`, prefix `c` | `claude --bg` in `$PWD`, wait for its `id` to be listed, switch to it |
-| Agent view | `:v`, prefix `v` | run `claude agents` in the client pane; `/resume` brings back older conversations |
-| Stop | `:x`, prefix `x` | confirm, `claude stop <id>`; its terminal is kept |
-| Remove | `:D`, prefix `D` | confirm, saying that work in progress is stopped; `claude rm <id>`; on success its terminal is killed |
-| Shutdown | `:s`, prefix `s` | confirm, saying that terminals die when there are any; kill the tmux server; sessions keep running |
+| New session | `:c`, prefix `c` | in the cursor's project: `claude --bg` there, wait for its `id` to be listed, switch to it |
+| Agent view | `:v`, prefix `v` | in the cursor's project: run `claude agents` in the client pane; `/resume` brings back older conversations |
+| Stop | `:x`, prefix `x` | confirm, `claude stop <id>` on the cursor's session; its terminal is kept |
+| Remove | `:D`, prefix `D` | confirm, saying that work in progress is stopped; `claude rm <id>` on the cursor's session; on success its terminal is killed |
+| Shutdown | `:s`, prefix `s` | confirm, saying that terminals die when any view has one; kill every project's tmux server; sessions keep running |
 
 - **Prefix `a` is not taken.** As in claude-spaces it types a literal grave, for users whose
   tmux prefix is the grave.
-- **Stop and remove from another pane mean the session being looked at.** Pressed with the
-  prefix while the picker is not focused, they act on `shown`, not on the row the cursor was
-  left on. With nothing shown, or from the picker itself, they act on the cursor row. The list
-  is drawn again before the question, so the row asked about is the one highlighted.
+- **From the picker, the cursor decides.** New session, agent view, rename project, stop and
+  remove act on the row under the cursor, whatever its project. A command opened from the menu
+  counts as from the picker.
+  - Stop and remove need nothing from the project: Claude takes the `id`. They run from where
+    the user is, and the view does not change. A project row has nothing to stop.
+  - New session and agent view need the project's own picker: its directory, its client pane
+    for the trust dialog, its `new_session`. On a row of another project the picker hops there
+    and leaves the command in `switch_target` (§ Other projects). That project's picker runs it.
+  - Detach and the terminal keys belong to the attached view. They have no row to act on.
+- **A prefix key from another pane means what is being looked at.** Pressed with the prefix
+  while the picker is not focused, stop and remove act on `shown`, not on the row the cursor was
+  left on. `shown` can be another project's session, opened from agent view. New session and
+  agent view act on the picker's own project. With nothing shown, stop and remove act on the
+  cursor row. The list is drawn again before the question, so the row asked about is the one
+  highlighted.
+- **Another project's session, stopped or removed from here.** That project's picker is not
+  told. It finds out as it does when a session is ended from outside. It goes to the welcome
+  screen if it was showing the session. It kills the terminal once the session has been missing
+  from five polls (§ Terminals), and it polls only while a client is attached: the terminal
+  lives until that project is next opened.
+- **Shutdown closes every view.** With one list for every project the servers are plumbing, and
+  which projects have one is not shown. Shutdown ends them all: every tmux server whose socket
+  is named `csa-*` in tmux's socket directory, and every directory under the state root that
+  holds `project_path`. Nothing else under the state root is removed. The picker's own server
+  goes last, because the picker dies with it. Every terminal window attached to a view returns
+  to its shell. `--reset` still closes one project's view. Shutdown is the one command that
+  reaches another project's server.
 - **Command output is shown.** A command's message goes to the picker's footer, on success as
   well as on failure. A known failure is `kept <id>` with a reason from `claude rm`. The one
   message that is not shown is `Workspace not trusted` from `claude --bg` (below).
 - **Where it is shown.** A note is a failing poll, or else the last command's message. It has
-  rows of its own between the key hints and the version: centered, in the bell colour, with an
-  empty row above and below. The version stays, below it. A command's message goes away at the
-  next key; a poll error stays until a poll succeeds.
+  rows of its own under the key hints: centered, in the bell colour, with an empty row above.
+  A command's message goes away at the next key; a poll error stays until a poll succeeds. The
+  version is not in the footer: it is the top bar.
   - A note longer than the pane's width is split into two rows. The break is the last space
     that keeps the first row within the width, or the width itself when there is no such
     space. The second row is cut to the width. There is no third row.
   - A list that fills the pane gives up two rows while a note is shown, and three when the
-    note has two rows, so the note always has its rows and the empty ones.
-  - With no sessions there is no footer, and an empty list has no text of its own. A failing
-    poll is shown on the row under the header, indented and in the dim colour, and split into
-    two rows by the same rule. The command's message is drawn as a note under that: its first
-    row is the fourth of the pane, or the fifth under a failing poll on two rows.
+    note has two rows, so the note always has its rows and the empty one, down to the last row
+    of the pane.
+  - With no sessions the list still has the picker's own project row, so there is a footer, and
+    a failing poll is a note like any other. Only a search can leave no rows. It says
+    `No matches.` under the search bar, and nothing else.
   - The search view shows no note.
-- **Jump numbers** go to session rows, of this project and of the others, as in claude-spaces.
-  There are ten. Rows that are not dim get theirs first, whatever their project; dim rows fill
-  what is left, in list order. The numbers themselves run in display order, `1` to `9`, then
-  `0`. A number on another project's session hops there, as `Enter` on its row does.
+- **Jump numbers** go to session rows, of every project, as in claude-spaces. There are ten.
+  Rows that are not dim get theirs first, whatever their project; dim rows fill what is left, in
+  list order. The numbers themselves run in display order, `1` to `9`, then `0`. A number on
+  another project's session hops there, as `Enter` on its row does. The list is the same in
+  every picker, so a number means the same session in each. Project rows take none.
 - **`Workspace not trusted`.** `claude --bg` has no terminal and cannot ask about a directory
   never opened before: it fails and starts nothing. The picker opens agent view in the client
   pane, which shows Claude's trust dialog. The dialog says what the message would, so the
@@ -478,6 +536,8 @@ Further rules:
 - A terminal is killed after the picker's own `claude rm` succeeds, or when its `id` has been
   missing from 5 consecutive successful polls. Stopping a session keeps its terminal. A failed
   poll never kills anything: a terminal can hold a running process.
+- A session removed from another project's picker is the second case: its terminal is in its
+  own project's server, which the picker that removed it does not touch.
 - Closing the shell closes the terminal. On the next scan its state is forgotten, and the
   terminal key opens a new one. Nothing brings a dead terminal back on its own.
 - The welcome screen has no terminal. When it is shown, or a client exits, the terminal in the
@@ -570,8 +630,8 @@ State lives in `${XDG_RUNTIME_DIR}/claude-spaces-agents/<sanitized-cwd>/`, or un
 | `compat_version` | gate constant this server's topology was built with |
 | `restart_required` | marker: the picker found an incompatible server and killed it |
 | `project_path` | real filesystem path of the project |
-| `switch_target` | project path to hop to, and optionally the `id` to show there |
-| `pending_load` | `id` to show; written by the launcher after a hop |
+| `switch_target` | project path to hop to, and optionally what to do there: the `id` to show, or `new` or `agents` |
+| `pending_load` | what a hop asked for: an `id` to show, or `new` or `agents`; written by the launcher after a hop |
 | `<state-root>/agents.json` | shared poll cache |
 
 The state dir is wiped when the recorded `picker_pane` is dead, as today: `term/<id>` holds pane
@@ -634,6 +694,15 @@ roughly 15% of a core per picker.
 - **Removing a session on stale state.** `claude rm` stops work without asking. Check on a fresh
   poll, right before the call.
 - **`--cwd` for scoping.** It is a prefix match.
+- **One list for every picker.** Nothing a picker has of its own may enter a sort key: not
+  `$PWD`, not the cursor. If it does, the list changes at every hop again (§ Projects).
+- **Running a project's command from another project's picker.** New session and agent view
+  belong to the project's own picker. Its state dir is wiped by the launcher when its server is
+  not running, so nothing written there from outside survives a hop.
+- **Shutdown and the tests.** Shutdown ends every server named `csa-*` in tmux's socket
+  directory. The tests run in a socket directory of their own and name their own servers
+  `test-csa-*`. Without the first, the shutdown test would end the user's views; without the
+  second, the harness.
 - **Codes mosh drops.** mosh passes neither the dim attribute (SGR 2) nor a cursor colour (OSC 12
   and 112). So the dim look is a grey foreground, and the search field's cursor is a drawn cell,
   there only while the picker is the active pane (§ Verified).
@@ -645,10 +714,14 @@ resolution, the session names and hidden files (project names are kept), inactiv
 discovery, `cs_discover_servers` and the `.servers/` registry, the `alert-bell` hook and the Stop
 hook it needed (the focus hooks stay), and deleting Claude's `sessions/<pid>.json` on close.
 
+The list needs no server discovery: it comes from Claude. Shutdown is the one place that looks
+for the other servers, by their sockets, with no registry (§ Actions).
+
 ## Testing
 
 Same harness as claude-spaces: an isolated tmux server and the script's functions evaluated up
-to the entrypoint marker. Claude is replaced by a fake `claude` on `PATH`:
+to the entrypoint marker. The servers of a test run are in a socket directory of their own
+(`TMUX_TMPDIR`), apart from the user's views. Claude is replaced by a fake `claude` on `PATH`:
 
 - `agents --json --all` prints a fixture file.
 - `attach <id>` records every SIGWINCH to a file and sleeps. Like the real one on a session that
@@ -684,7 +757,8 @@ to move.
 
 **The launcher** is tested with the real script, started in a pane of a second tmux server with
 a scratch `HOME`: launch, detach, re-attach, the prefix table, the preflight, the compatibility
-gate, a hop to another project, and parking a terminal with a real client attached.
+gate, a hop to another project, a new session started in another project, a shutdown that
+closes two views, and parking a terminal with a real client attached.
 
 **Every test has been seen failing.** `run_breaks` holds one or more breaks per test:
 lines of `claude-spaces-agents` to damage and the tests that must go red. It applies each to a copy,

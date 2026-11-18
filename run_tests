@@ -261,6 +261,39 @@ assert_eq() {
   fi
 }
 
+# The ids of the session rows, in list order. The list has more rows than
+# these: this project's row, always, and one for every other project.
+session_ids() {
+  local i out=""
+  for ((i = 0; i < ${#ENTRIES_ID[@]}; i++)); do
+    case "${ENTRIES_TYPE[${i}]}" in
+      local|remote) out+="${out:+ }${ENTRIES_ID[${i}]}" ;;
+    esac
+  done
+  echo "${out}"
+}
+
+# The names of the project rows, in list order
+project_names() {
+  local i
+  for ((i = 0; i < ${#ENTRIES_ID[@]}; i++)); do
+    [[ "${ENTRIES_TYPE[${i}]}" == "project" ]] && printf '%s|' "${ENTRIES_NAME[${i}]}"
+  done
+}
+
+# select_row <id> — put the cursor on that row
+select_row() {
+  local idx
+  cs_find_entry_index "$1" idx
+  [[ "${idx}" != "-1" ]] || { fail "no row '$1'"; return 1; }
+  SELECTED=${idx}
+}
+
+# The id of this project's own row
+own_row() {
+  echo "__proj_$(cs_sanitize_path "${PWD}")__"
+}
+
 client_title() {
   _tmux display-message -p -t "${CLIENT_PANE}" '#{pane_title}'
 }
@@ -537,7 +570,7 @@ e2e_launch() {
   else
     env -i HOME="${TEST_TMP}/e2e/home" USER="$(id -un)" LANG="${LANG:-C.UTF-8}" TERM=xterm-256color \
       SHELL=/bin/bash PATH="${PATH}" XDG_RUNTIME_DIR="${TEST_TMP}/e2e/run" \
-      FAKE_CLAUDE_DIR="${FAKE_CLAUDE_DIR}" \
+      FAKE_CLAUDE_DIR="${FAKE_CLAUDE_DIR}" TMUX_TMPDIR="${TMUX_TMPDIR}" \
       tmux -L "${E2E_OUTER}" -f /dev/null new-session -d -s o -x 150 -y 40 "${cmd}"
   fi
 }
@@ -588,14 +621,20 @@ e2e_picker_text() {
 # ── Setup / teardown ─────────────────────────────
 cs_test_setup() {
   TEST_TMP=$(mktemp -d)
-  TEST_SESSION="csa-test-$$"
-  TMUX_SERVER="csa-test-$$"
-  E2E_OUTER="csa-test-outer-$$"
+  # Not named like a view (csa-…): shutdown closes every server that is.
+  TEST_SESSION="test-csa-$$"
+  TMUX_SERVER="test-csa-$$"
+  E2E_OUTER="test-csa-outer-$$"
   export TERM="${TERM:-xterm}"
 
   mkdir -p "${TEST_TMP}/state/term" "${TEST_TMP}/state-root" "${TEST_TMP}/claude/projects/proj"
   mkdir -p "${TEST_TMP}/config" "${TEST_TMP}/data/seen" "${TEST_TMP}/fake" "${TEST_TMP}/bin"
   mkdir -p "${TEST_TMP}/project"
+
+  # A socket directory of the tests' own. Shutdown closes every view it finds
+  # by its socket: in tmux's default directory it would find the user's.
+  mkdir -p "${TEST_TMP}/tmux"
+  export TMUX_TMPDIR="${TEST_TMP}/tmux"
 
   CLAUDE_DIR="${TEST_TMP}/claude"
   PROJECTS_DIR="${CLAUDE_DIR}/projects"
@@ -734,7 +773,7 @@ test_list_background_only() {
   fake_add bbbbbbb1 done idle "typed in a terminal" "${PWD}" interactive
   cs_poll 1 || { fail "poll failed"; return 1; }
   cs_rescan
-  assert_eq "listed" "${ENTRIES_ID[*]}" "aaaaaaa1"
+  assert_eq "listed" "$(session_ids)" "aaaaaaa1"
 }
 
 # This project's rows are its own sessions and the ones in its worktrees. A
@@ -766,7 +805,7 @@ test_ids_validated() {
   fake_add 'AAAAAAA1' done idle "wrong case"
   cs_poll 1 || { fail "poll failed"; return 1; }
   cs_rescan
-  assert_eq "listed" "${ENTRIES_ID[*]}" "aaaaaaa1" || return 1
+  assert_eq "listed" "$(session_ids)" "aaaaaaa1" || return 1
   assert_eq "known ids" "${AG_IDS[*]}" "aaaaaaa1"
 }
 
@@ -775,10 +814,12 @@ test_name_control_chars_stripped() {
   fake_add aaaaaaa1 done idle $'bad\e[31mname\x07'
   cs_poll 1 || { fail "poll failed"; return 1; }
   cs_rescan
-  case "${ENTRIES_NAME[0]}" in
-    *[[:cntrl:]]*) fail "control character left in '${ENTRIES_NAME[0]}'"; return 1 ;;
+  local idx
+  cs_find_entry_index aaaaaaa1 idx
+  case "${ENTRIES_NAME[${idx}]}" in
+    *[[:cntrl:]]*) fail "control character left in '${ENTRIES_NAME[${idx}]}'"; return 1 ;;
   esac
-  assert_eq "name" "${ENTRIES_NAME[0]}" "bad [31mname "
+  assert_eq "name" "${ENTRIES_NAME[${idx}]}" "bad [31mname "
 }
 
 # A failed poll keeps the last list and says why; it never shows an empty one.
@@ -792,7 +833,7 @@ test_poll_failure_keeps_list() {
   fi
   assert_eq "error" "${POLL_ERROR}" "simulated failure" || return 1
   cs_rescan
-  assert_eq "listed" "${ENTRIES_ID[*]}" "aaaaaaa1" || return 1
+  assert_eq "listed" "$(session_ids)" "aaaaaaa1" || return 1
   rm -f "${FAKE_CLAUDE_DIR}/fail"
   cs_poll 1 || { fail "poll after recovery failed"; return 1; }
   assert_eq "error after recovery" "${POLL_ERROR}" ""
@@ -821,25 +862,33 @@ test_order_and_names() {
   cs_rescan
   local names
   names=$(printf '%s|' "${ENTRIES_NAME[@]}")
+  # The first row is the project's own.
   # Aardvark is recent but was stopped while idle: it has no process, so it comes
   # after the recent ones that have one, whatever its name.
   # the promptless one has no transcript: it sorts by when it started, long ago
-  assert_eq "order" "${names}" "Alpha|beta|Aardvark|aaa (failed)|zeta|eta|(new session)|"
+  assert_eq "order" "${names}" "project|Alpha|beta|Aardvark|aaa (failed)|zeta|eta|(new session)|"
 }
 
-# Other projects come after this one: a header, then each project with its
-# sessions under it, most recent first. Projects that share a folder name are
-# told apart, and a custom project name wins.
-test_other_projects_rows() {
+# Every project is a project row with its sessions under it, and an empty row
+# between two projects. This project is one of them, with no place of its own
+# and no line to set the others apart. Projects that share a folder name are
+# told apart, and a custom project name wins. Another project's sessions follow
+# the rule this project's do: the recent ones by name, then the rest, most
+# recent first.
+test_project_rows() {
   local now
   now=$(date +%s)
   fake_add aaaaaaa1 done idle "mine"
   fake_add bbbbbbb1 done idle "older" "/work/client-a/api"
   fake_add bbbbbbb2 done idle "newer" "/work/client-a/api"
+  fake_add bbbbbbb3 done idle "zulu" "/work/client-a/api"
+  fake_add bbbbbbb4 done idle "alpha" "/work/client-a/api"
   fake_add ccccccc1 done idle "theirs" "/work/client-b/api"
   fake_add ddddddd1 done idle "solo" "/work/tools"
   fake_transcript bbbbbbb1 $((now - 5000))
-  fake_transcript bbbbbbb2 $((now - 50))
+  fake_transcript bbbbbbb2 $((now - 4000))
+  fake_transcript bbbbbbb3 $((now - 50))
+  fake_transcript bbbbbbb4 $((now - 20))
   PROJECT_NAMES["$(cs_sanitize_path /work/tools)"]="My tools"
   cs_poll 1 || { fail "poll failed"; return 1; }
   cs_rescan
@@ -847,11 +896,77 @@ test_other_projects_rows() {
   for ((i = 0; i < ${#ENTRIES_ID[@]}; i++)); do
     rows+="${ENTRIES_TYPE[${i}]}:${ENTRIES_NAME[${i}]}|"
   done
+  # client-a/api has recent sessions and comes first. The other three were last
+  # active at the same moment, so their names decide.
   assert_eq "rows" "${rows}" \
-    "local:mine|spacer:|header:other projects|project:client-a/api|remote:newer|remote:older|spacer:|project:client-b/api|remote:theirs|spacer:|project:My tools|remote:solo|" || return 1
+    "project:client-a/api|remote:alpha|remote:zulu|remote:newer|remote:older|spacer:|project:client-b/api|remote:theirs|spacer:|project:My tools|remote:solo|spacer:|project:project|local:mine|" || return 1
   local idx
   cs_find_entry_index bbbbbbb2 idx
   assert_eq "a remote row carries its project path" "${ENTRIES_PATH[${idx}]}" "/work/client-a/api"
+}
+
+# Projects with a session that sorts as recent come first, by name. The rest
+# follow, most recent first. A session that ended does not make its project
+# recent. This project is where the rule puts it, and while it has no session
+# it is listed as recent, which is where its first session will put it.
+test_project_order() {
+  local now
+  now=$(date +%s)
+  fake_add aaaaaaa1 done idle "here, two hours ago"
+  fake_add bbbbbbb1 done idle "recent" "/work/a/zebra"
+  fake_add ccccccc1 done idle "recent" "/work/z/Apple"
+  fake_add ddddddd1 done idle "an hour ago" "/work/hour"
+  fake_add eeeeeee1 done idle "a day ago" "/work/day"
+  fake_add fffffff1 failed "" "failed a moment ago" "/work/failed"
+  fake_transcript aaaaaaa1 $((now - 7200))
+  fake_transcript bbbbbbb1 $((now - 30))
+  fake_transcript ccccccc1 $((now - 300))
+  fake_transcript ddddddd1 $((now - 3600))
+  fake_transcript eeeeeee1 $((now - 86400))
+  fake_transcript fffffff1 $((now - 10))
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  assert_eq "projects" "$(project_names)" "Apple|zebra|failed|hour|project|day|" || return 1
+
+  # with no session, this project is among the recent ones, by its name
+  fake_drop aaaaaaa1
+  cs_poll 1 || { fail "second poll failed"; return 1; }
+  cs_rescan
+  assert_eq "projects, this one empty" "$(project_names)" "Apple|project|zebra|failed|hour|day|"
+}
+
+# The list does not depend on the project whose picker builds it: the same rows
+# in the same order, from here and from another project. What a row does is the
+# only difference: a session of the picker's own project is shown, any other
+# hops.
+test_same_list_from_any_project() {
+  local now here="${PWD}" there="/work/there"
+  now=$(date +%s)
+  fake_add aaaaaaa1 done idle "here, an hour ago"
+  fake_add bbbbbbb1 done idle "there, a moment ago" "${there}"
+  fake_add ccccccc1 done idle "elsewhere, a day ago" "/work/elsewhere"
+  fake_transcript aaaaaaa1 $((now - 3600))
+  fake_transcript bbbbbbb1 $((now - 30))
+  fake_transcript ccccccc1 $((now - 86400))
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  local from_here="${ENTRIES_ID[*]}" idx mine_here
+  cs_find_entry_index aaaaaaa1 idx
+  mine_here="${ENTRIES_TYPE[${idx}]}"
+
+  PWD="${there}"
+  cs_rescan
+  local from_there="${ENTRIES_ID[*]}" mine_there theirs_there
+  cs_find_entry_index aaaaaaa1 idx
+  mine_there="${ENTRIES_TYPE[${idx}]}"
+  cs_find_entry_index bbbbbbb1 idx
+  theirs_there="${ENTRIES_TYPE[${idx}]}"
+  PWD="${here}"
+
+  assert_eq "the list from another project" "${from_there}" "${from_here}" || return 1
+  assert_eq "here, this project's session" "${mine_here}" "local" || return 1
+  assert_eq "there, this project's session" "${mine_there}" "remote" || return 1
+  assert_eq "there, that project's session" "${theirs_there}" "local"
 }
 
 # Jump numbers go to session rows, of this project and of the others, and to
@@ -859,9 +974,12 @@ test_other_projects_rows() {
 # first, whatever their project, and dim rows fill what is left in list order.
 # The numbers themselves always run in display order.
 test_jump_slots() {
-  local i idx
+  local i idx now
+  now=$(date +%s)
+  # active a moment ago: this project is listed above the other
   for i in 1 2 3; do
     fake_add "aaaaaaa${i}" done idle "session ${i}"
+    fake_transcript "aaaaaaa${i}" $((now - 60))
   done
   fake_add bbbbbbb1 done idle "theirs" "/work/other"
   cs_poll 1 || { fail "poll failed"; return 1; }
@@ -915,8 +1033,9 @@ test_jump_slots() {
   assert_eq "slots with show_index off" "${#JUMP_SLOT[@]}" "0"
 }
 
-# On the screen, another project's session carries its number where its indent
-# was. With show_index off there are no numbers and the indent is back.
+# On the screen a session carries its number where its indent was, in this
+# project and in any other. With show_index off there are no numbers and the
+# indent is back: every session sits under its project.
 test_jump_numbers_drawn() {
   local now
   now=$(date +%s)
@@ -928,16 +1047,18 @@ test_jump_numbers_drawn() {
   cs_poll 1 || { fail "poll failed"; return 1; }
   cs_rescan
   local -a row
-  # 1 header, 2-3 this project, 4 empty, 5 "other projects", 6 the project, 7 its session
+  # 1 top bar, 2 this project, 3-4 its sessions, 5 empty, 6 the other project, 7 its session
   screen_rows 40 20
-  [[ "${row[2]}" == "1 alpha "* ]] || { fail "this project's first row: '${row[2]}'"; return 1; }
-  [[ "${row[3]}" == "2 beta "* ]] || { fail "this project's second row: '${row[3]}'"; return 1; }
-  assert_eq "the project row has no number" "${row[6]}" "other" || return 1
+  assert_eq "this project's row has no number" "${row[2]}" "project" || return 1
+  [[ "${row[3]}" == "1 alpha "* ]] || { fail "this project's first session: '${row[3]}'"; return 1; }
+  [[ "${row[4]}" == "2 beta "* ]] || { fail "this project's second session: '${row[4]}'"; return 1; }
+  assert_eq "the row between two projects" "${row[5]}" "" || return 1
+  assert_eq "another project's row has no number" "${row[6]}" "other" || return 1
   assert_eq "another project's session" "${row[7]}" "3 theirs" || return 1
 
   SHOW_INDEX=0
   screen_rows 40 20
-  [[ "${row[2]}" == "alpha "* ]] || { fail "show_index off, this project's first row: '${row[2]}'"; return 1; }
+  [[ "${row[3]}" == "  alpha "* ]] || { fail "show_index off, this project's first session: '${row[3]}'"; return 1; }
   assert_eq "show_index off, another project's session" "${row[7]}" "  theirs"
 }
 
@@ -946,6 +1067,8 @@ test_jump_numbers_drawn() {
 test_jump_key_hops() {
   fake_add aaaaaaa1 done idle "mine"
   fake_add bbbbbbb1 done idle "theirs" "/work/other"
+  # active a moment ago: this project is listed above the other
+  fake_transcript aaaaaaa1 $(($(date +%s) - 60))
   cs_poll 1 || { fail "poll failed"; return 1; }
   cs_rescan
   cs_jump_to_session 7
@@ -1486,7 +1609,7 @@ test_stop_shows_feedback() {
   cs_poll 1 || { fail "poll failed"; return 1; }
   cs_rescan
   cs_show_session aaaaaaa1 || { fail "show failed"; return 1; }
-  SELECTED=0
+  select_row aaaaaaa1 || return 1
   cs_confirm_end stop "Stop? y/N" <<< "n" > /dev/null
   [[ ! -f "${FAKE_CLAUDE_DIR}/cmd.log" ]] || { fail "stopped without a yes"; return 1; }
   cs_confirm_end stop "Stop? y/N" <<< "y" > /dev/null
@@ -1494,7 +1617,7 @@ test_stop_shows_feedback() {
   assert_eq "footer" "${FOOTER_MSG}" "stopped aaaaaaa1" || return 1
   assert_eq "displayed" "${DISPLAYED}" "" || return 1
   assert_eq "client title" "$(client_title)" "${CS_T_WELCOME}" || return 1
-  assert_eq "still listed" "${ENTRIES_ID[*]}" "aaaaaaa1" || return 1
+  assert_eq "still listed" "$(session_ids)" "aaaaaaa1" || return 1
   seen_at aaaaaaa1 "$(date +%s)"
   cs_poll 1
   cs_rescan
@@ -1513,7 +1636,7 @@ test_remove_drops_the_row() {
   SELECTED=${idx}
   cs_confirm_end rm "Remove (stops work)? y/N" <<< "y" > /dev/null
   assert_eq "footer" "${FOOTER_MSG}" "removed aaaaaaa1" || return 1
-  assert_eq "listed" "${ENTRIES_ID[*]}" "aaaaaaa2"
+  assert_eq "listed" "$(session_ids)" "aaaaaaa2"
 }
 
 # A prefix key pressed from the Claude pane means the session being looked at,
@@ -1557,13 +1680,23 @@ test_prefix_stop_targets_shown() {
   [[ "${out}" == *"beta"*"Stop? y/N"* ]] || { fail "the list is not drawn before the question"; return 1; }
 }
 
-# The shutdown question says that terminals die, when there are any.
+# The shutdown question says that terminals die, when there are any: in this
+# view or in another project's, since shutdown closes them all.
 test_shutdown_prompt() {
   fake_add aaaaaaa1 done idle "alpha"
   cs_poll 1 || { fail "poll failed"; return 1; }
   local out
   out=$(cs_confirm_shutdown <<< "n")
   [[ "${out}" == *"Shutdown? y/N"* ]] || { fail "plain prompt not shown"; return 1; }
+  local other="${CS_STATE_ROOT}/-work-other"
+  mkdir -p "${other}/term"
+  echo "/work/other" > "${other}/project_path"
+  echo "%99" > "${other}/term/bbbbbbb1"
+  out=$(cs_confirm_shutdown <<< "n")
+  rm -rf "${other}"
+  [[ "${out}" == *"kill terminals"* ]] || { fail "the prompt does not mention a terminal in another view"; return 1; }
+  out=$(cs_confirm_shutdown <<< "n")
+  [[ "${out}" == *"Shutdown? y/N"* ]] || { fail "plain prompt not back"; return 1; }
   show_with_terminal aaaaaaa1 bottom || { fail "setup failed"; return 1; }
   out=$(cs_confirm_shutdown <<< "n")
   [[ "${out}" == *"kill terminals"* ]] || { fail "the prompt does not mention terminals"; return 1; }
@@ -1572,10 +1705,10 @@ test_shutdown_prompt() {
 
 # ── Tests: what the picker draws ─────────────────
 
-# A note (a command's own line, or a failing poll) has rows of its own between
-# the key hints and the version: centered, in the bell colour, on two rows when
-# it is longer than the pane, with an empty row above and below. The version
-# stays, below it.
+# The version is in the top bar. A note (a command's own line, or a failing
+# poll) has rows of its own under the key hints: centered, in the bell colour,
+# on two rows when it is longer than the pane, with an empty row above it and
+# nothing below.
 test_footer_note() {
   fake_add aaaaaaa1 done idle "alpha"
   fake_add aaaaaaa2 done idle "beta"
@@ -1586,68 +1719,67 @@ test_footer_note() {
   hints=$(centered40 "Q:detach  ?:help")
   version=$(centered40 "spaces-agents v${VERSION}")
 
-  # 40 columns by 20 rows: 1 header, 2-3 sessions, 4 empty, 5-6 key hints
+  # 40 columns by 20 rows: 1 top bar, 2 the project, 3-4 sessions, 5 empty,
+  # 6-7 key hints
   screen_rows 40 20
-  assert_eq "key hints" "${row[6]}" "${hints}" || return 1
-  assert_eq "no note: the row under the key hints" "${row[7]}" "" || return 1
-  assert_eq "no note: the version" "${row[8]}" "${version}" || return 1
+  assert_eq "the top bar" "${row[1]}" "${version}" || return 1
+  assert_eq "key hints" "${row[7]}" "${hints}" || return 1
+  assert_eq "no note: the row under the key hints" "${row[8]}" "" || return 1
+  assert_eq "no note: the row after that" "${row[9]}" "" || return 1
 
   FOOTER_MSG="stopped aaaaaaa1"
   note=$(centered40 "${FOOTER_MSG}")
   screen_rows 40 20
-  assert_eq "key hints, with a note" "${row[6]}" "${hints}" || return 1
-  assert_eq "the row above the note" "${row[7]}" "" || return 1
-  assert_eq "the note" "${row[8]}" "${note}" || return 1
-  assert_eq "the row below the note" "${row[9]}" "" || return 1
-  assert_eq "the version, with a note" "${row[10]}" "${version}" || return 1
-  assert_eq "the row below the version" "${row[11]}" "" || return 1
+  assert_eq "key hints, with a note" "${row[7]}" "${hints}" || return 1
+  assert_eq "the row above the note" "${row[8]}" "" || return 1
+  assert_eq "the note" "${row[9]}" "${note}" || return 1
+  assert_eq "the row below the note" "${row[10]}" "" || return 1
   screen_rows 40 20 colors
-  [[ "${row[8]}" == *$'\e[31m'*"stopped aaaaaaa1"* ]] || { fail "the note is not in the bell colour: $(printf '%q' "${row[8]}")"; return 1; }
+  [[ "${row[9]}" == *$'\e[31m'*"stopped aaaaaaa1"* ]] || { fail "the note is not in the bell colour: $(printf '%q' "${row[9]}")"; return 1; }
 
   # Longer than the pane: two rows, split at the last space that fits, each
-  # centered. The version goes one row lower.
+  # centered.
   local long="kept aaaaaaa1: the session still has work that is not saved"
   local long1 long2
   long1=$(centered40 "kept aaaaaaa1: the session still has")
   long2=$(centered40 "work that is not saved")
   FOOTER_MSG="${long}"
   screen_rows 40 20
-  assert_eq "a long note: key hints" "${row[6]}" "${hints}" || return 1
-  assert_eq "a long note: the row above" "${row[7]}" "" || return 1
-  assert_eq "a long note: the first row" "${row[8]}" "${long1}" || return 1
-  assert_eq "a long note: the second row" "${row[9]}" "${long2}" || return 1
-  assert_eq "a long note: the row below" "${row[10]}" "" || return 1
-  assert_eq "a long note: the version" "${row[11]}" "${version}" || return 1
-  assert_eq "a long note: the row below the version" "${row[12]}" "" || return 1
+  assert_eq "a long note: key hints" "${row[7]}" "${hints}" || return 1
+  assert_eq "a long note: the row above" "${row[8]}" "" || return 1
+  assert_eq "a long note: the first row" "${row[9]}" "${long1}" || return 1
+  assert_eq "a long note: the second row" "${row[10]}" "${long2}" || return 1
+  assert_eq "a long note: the row below" "${row[11]}" "" || return 1
 
   # a space right after the last column: the first row is full
   FOOTER_MSG="0123456789 123456789 123456789 123456789 tail"
   screen_rows 40 20
-  assert_eq "a full first row" "${row[8]}" "0123456789 123456789 123456789 123456789" || return 1
-  assert_eq "the row after a full first row" "${row[9]}" "$(centered40 "tail")" || return 1
+  assert_eq "a full first row" "${row[9]}" "0123456789 123456789 123456789 123456789" || return 1
+  assert_eq "the row after a full first row" "${row[10]}" "$(centered40 "tail")" || return 1
 
   # no space to split at: split at the last column
   FOOTER_MSG="0123456789012345678901234567890123456789ABCDEFGHIJKLMNOPQRST"
   screen_rows 40 20
-  assert_eq "no space: the first row" "${row[8]}" "0123456789012345678901234567890123456789" || return 1
-  assert_eq "no space: the second row" "${row[9]}" "$(centered40 "ABCDEFGHIJKLMNOPQRST")" || return 1
-  assert_eq "no space: the row below" "${row[10]}" "" || return 1
+  assert_eq "no space: the first row" "${row[9]}" "0123456789012345678901234567890123456789" || return 1
+  assert_eq "no space: the second row" "${row[10]}" "$(centered40 "ABCDEFGHIJKLMNOPQRST")" || return 1
+  assert_eq "no space: the row below" "${row[11]}" "" || return 1
 
   # too long for two rows: the second is cut, there is no third
   FOOTER_MSG="0123456789012345678901234567890123456789abcdefghijklmnopqrstuvwxyzabcdefghijklmnCUT"
   screen_rows 40 20
-  assert_eq "too long: the second row" "${row[9]}" "abcdefghijklmnopqrstuvwxyzabcdefghijklmn" || return 1
-  assert_eq "too long: the row below" "${row[10]}" "" || return 1
+  assert_eq "too long: the second row" "${row[10]}" "abcdefghijklmnopqrstuvwxyzabcdefghijklmn" || return 1
+  assert_eq "too long: the row below" "${row[11]}" "" || return 1
 
   # a failing poll is the note, before any command's line
   FOOTER_MSG="stopped aaaaaaa1"
   POLL_ERROR="simulated failure"
   screen_rows 40 20
-  assert_eq "a failing poll" "${row[8]}" "$(centered40 "simulated failure")" || return 1
+  assert_eq "a failing poll" "${row[9]}" "$(centered40 "simulated failure")" || return 1
   POLL_ERROR=""
 
-  # A list that fills the pane: 16 sessions, where 15 rows fit. While a note is
-  # shown the list gives up two rows, so the note still has its three.
+  # A list that fills the pane: the project's row and 16 sessions, where 16
+  # rows fit. While a note is shown the list gives up two rows, so the note
+  # still has its own and the empty one above it, down to the last row.
   local i
   for i in 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10; do
     fake_add "aaaaaa${i}" done idle "session ${i}"
@@ -1657,21 +1789,25 @@ test_footer_note() {
   SELECTED=0
   SCROLL=0
   screen_rows 40 20
-  assert_eq "full list: key hints" "${row[17]}" "${hints}" || return 1
-  assert_eq "full list: the row above the note" "${row[18]}" "" || return 1
-  assert_eq "full list: the note" "${row[19]}" "${note}" || return 1
-  assert_eq "full list: the row below the note" "${row[20]}" "" || return 1
+  assert_eq "full list: key hints" "${row[18]}" "${hints}" || return 1
+  assert_eq "full list: the row above the note" "${row[19]}" "" || return 1
+  assert_eq "full list: the note" "${row[20]}" "${note}" || return 1
   # a note on two rows takes one more row from the list
   FOOTER_MSG="${long}"
   screen_rows 40 20
-  assert_eq "full list, two rows: key hints" "${row[16]}" "${hints}" || return 1
-  assert_eq "full list, two rows: the row above" "${row[17]}" "" || return 1
-  assert_eq "full list, two rows: the first row" "${row[18]}" "${long1}" || return 1
-  assert_eq "full list, two rows: the second row" "${row[19]}" "${long2}" || return 1
-  assert_eq "full list, two rows: the row below" "${row[20]}" "" || return 1
+  assert_eq "full list, two rows: key hints" "${row[17]}" "${hints}" || return 1
+  assert_eq "full list, two rows: the row above" "${row[18]}" "" || return 1
+  assert_eq "full list, two rows: the first row" "${row[19]}" "${long1}" || return 1
+  assert_eq "full list, two rows: the second row" "${row[20]}" "${long2}" || return 1
+  # Too long for two rows, with the second on the last row of the pane: one that
+  # was not cut would run over the edge and scroll everything up.
+  FOOTER_MSG="0123456789012345678901234567890123456789abcdefghijklmnopqrstuvwxyzabcdefghijklmnCUT"
+  screen_rows 40 20
+  assert_eq "full list, too long: key hints" "${row[17]}" "${hints}" || return 1
+  assert_eq "full list, too long: the second row" "${row[20]}" "abcdefghijklmnopqrstuvwxyzabcdefghijklmn" || return 1
   FOOTER_MSG=""
   screen_rows 40 20
-  assert_eq "full list, no note: key hints are back down" "${row[19]}" "${hints}" || return 1
+  assert_eq "full list, no note: key hints are back down" "${row[20]}" "${hints}" || return 1
 
   # The search view has no footer and shows no note: a failing poll must not
   # take rows from the list there.
@@ -1682,56 +1818,62 @@ test_footer_note() {
     || { fail "searching: the list lost rows to a note that is not shown: '${row[16]}'"; return 1; }
 }
 
-# With no sessions there is no footer, and no text either. A command that failed
-# still has to say so: its line is drawn like any other note, and a failing
-# poll has the rows above it.
-test_empty_list_note() {
+# With no sessions the list still has this project's row, so there is a footer.
+# A command that failed says so there, and so does a failing poll: neither can
+# be taken for an empty list. Only a search leaves no rows, and says so.
+test_no_sessions_view() {
   cs_rescan
   local -a row
+  local hints
+  hints=$(centered40 "Q:detach  ?:help")
+  # 1 top bar, 2 this project, 3 empty, 4-5 key hints
   screen_rows 40 20
-  assert_eq "an empty list has no text" "${row[2]}" "" || return 1
-  assert_eq "no note" "${row[4]}" "" || return 1
+  assert_eq "this project's row" "${row[2]}" "project" || return 1
+  assert_eq "its own row offers the menu, not a hop" "${row[4]}" "$(centered40 ": menu  / search")" || return 1
+  assert_eq "key hints" "${row[5]}" "${hints}" || return 1
+  assert_eq "no note" "${row[7]}" "" || return 1
 
   FOOTER_MSG="Could not start the service"
   screen_rows 40 20
-  assert_eq "the row under the header, with a note" "${row[2]}" "" || return 1
-  assert_eq "the row above the note" "${row[3]}" "" || return 1
-  assert_eq "the note" "${row[4]}" "$(centered40 "${FOOTER_MSG}")" || return 1
-  assert_eq "the row below the note" "${row[5]}" "" || return 1
+  assert_eq "the row above the note" "${row[6]}" "" || return 1
+  assert_eq "the note" "${row[7]}" "$(centered40 "${FOOTER_MSG}")" || return 1
+  assert_eq "the row below the note" "${row[8]}" "" || return 1
 
   # a note longer than the pane is on two rows here as well
   FOOTER_MSG="kept aaaaaaa1: the session still has work that is not saved"
   screen_rows 40 20
-  assert_eq "a long note: the first row" "${row[4]}" "$(centered40 "kept aaaaaaa1: the session still has")" || return 1
-  assert_eq "a long note: the second row" "${row[5]}" "$(centered40 "work that is not saved")" || return 1
-  assert_eq "a long note: the row below" "${row[6]}" "" || return 1
+  assert_eq "a long note: the first row" "${row[7]}" "$(centered40 "kept aaaaaaa1: the session still has")" || return 1
+  assert_eq "a long note: the second row" "${row[8]}" "$(centered40 "work that is not saved")" || return 1
+  assert_eq "a long note: the row below" "${row[9]}" "" || return 1
 
-  # a failing poll keeps its own row; the command's line is still shown
+  # a failing poll is the note, and the list keeps its row
   FOOTER_MSG="Could not start the service"
   POLL_ERROR="simulated failure"
   screen_rows 40 20
-  assert_eq "a failing poll" "${row[2]}" "  simulated failure" || return 1
-  assert_eq "the note, under a failing poll" "${row[4]}" "$(centered40 "${FOOTER_MSG}")" || return 1
+  assert_eq "a failing poll: the list" "${row[2]}" "project" || return 1
+  assert_eq "a failing poll: the note" "${row[7]}" "$(centered40 "simulated failure")" || return 1
+  POLL_ERROR=""
+  FOOTER_MSG=""
 
-  # A failing poll longer than the pane is on two rows, both indented, and the
-  # command's line starts a row lower.
-  POLL_ERROR="could not read the session list from claude"
+  # a search that matches nothing says so, and has no footer
+  SEARCH_ACTIVE=1
+  SEARCH_TERM="zzz"
+  cs_search_apply_filter
   screen_rows 40 20
-  assert_eq "a long failing poll: the first row" "${row[2]}" "  could not read the session list from" || return 1
-  assert_eq "a long failing poll: the second row" "${row[3]}" "  claude" || return 1
-  assert_eq "a long failing poll: the row above the note" "${row[4]}" "" || return 1
-  assert_eq "a long failing poll: the note" "${row[5]}" "$(centered40 "${FOOTER_MSG}")" || return 1
-  assert_eq "a long failing poll: the row below the note" "${row[6]}" "" || return 1
+  assert_eq "no matches" "${row[2]}" "  No matches." || return 1
+  assert_eq "no matches: the row below" "${row[3]}" "" || return 1
+  assert_eq "no matches: no key hints" "${row[5]}" "" || return 1
+  SEARCH_ACTIVE=0
+  SEARCH_TERM=""
 
-  # a pane with no columns left after the indent still gets one character a row
+  # a pane with no columns still gets one character a row
   local -a parts
   cs_note_split parts "ab cd" -2
   assert_eq "no columns" "${parts[*]}" "a b"
 }
 
 # mosh drops the dim attribute, so what used to be dim is drawn in a grey: a row
-# with no process, the footer, the header of the other projects. Nothing on the
-# screen carries the attribute.
+# with no process, the footer. Nothing on the screen carries the attribute.
 test_dim_is_grey() {
   local now
   now=$(date +%s)
@@ -1744,15 +1886,13 @@ test_dim_is_grey() {
   cs_rescan
   local -a row
   local grey=$'\e\\[38;5;245m[^\e]*'
-  local section=$'\e\\[1m\e\\[38;5;245m─ other projects ─'
   local dim=$'\e\\[([0-9];)*2(;[0-9])*m'
   local i
-  # 1 header, 2 alpha (selected), 3 asleep, 4 empty, 5 "other projects",
-  # 6 the project, 7 its session, 8 empty, 9-10 key hints, 11 empty, 12 the version
+  # 1 top bar, 2 this project (selected), 3 alpha, 4 asleep, 5 empty,
+  # 6 the other project, 7 its session, 8 empty, 9-10 key hints
   screen_rows 40 20 colors
-  [[ "${row[3]}" =~ ${grey}asleep ]] || { fail "a row with no process is not grey: $(printf '%q' "${row[3]}")"; return 1; }
+  [[ "${row[4]}" =~ ${grey}asleep ]] || { fail "a row with no process is not grey: $(printf '%q' "${row[4]}")"; return 1; }
   [[ "${row[10]}" =~ ${grey}Q:detach ]] || { fail "the key hints are not grey: $(printf '%q' "${row[10]}")"; return 1; }
-  [[ "${row[5]}" =~ ${section} ]] || { fail "the section header is not bold and grey: $(printf '%q' "${row[5]}")"; return 1; }
   for ((i = 1; i < ${#row[@]}; i++)); do
     [[ "${row[i]}" =~ ${dim} ]] && { fail "row ${i} carries the dim attribute: $(printf '%q' "${row[i]}")"; return 1; }
   done
@@ -1908,9 +2048,15 @@ test_seen_sweep() {
 # Selecting another project, or one of its sessions, leaves the launcher a
 # switch_target: the project path, then the session to show there.
 test_hop_writes_switch_target() {
+  local now
+  now=$(date +%s)
   fake_add aaaaaaa1 done idle "mine"
   fake_add aaaaaaa2 done idle "mine, shown"
   fake_add bbbbbbb1 done idle "theirs" "/work/other"
+  # the other project was active a moment ago: it is listed above this one
+  fake_transcript aaaaaaa1 $((now - 3600))
+  fake_transcript aaaaaaa2 $((now - 7200))
+  fake_transcript bbbbbbb1 $((now - 30))
   cs_poll 1 || { fail "poll failed"; return 1; }
   cs_rescan
   cs_show_session aaaaaaa2 || { fail "setup failed"; return 1; }
@@ -1930,7 +2076,29 @@ test_hop_writes_switch_target() {
   cs_activate_selected
   assert_eq "for a project" "$(sed -n 1p "${STATE_DIR}/switch_target")" "/work/other" || return 1
   assert_eq "a project names no session" "$(sed -n 2p "${STATE_DIR}/switch_target")" "" || return 1
-  assert_eq "the cursor after a hop from a project" "${ENTRIES_ID[${SELECTED}]}" "aaaaaaa2"
+  assert_eq "the cursor after a hop from a project" "${ENTRIES_ID[${SELECTED}]}" "aaaaaaa2" || return 1
+
+  # this project's own row hops nowhere
+  rm -f "${STATE_DIR}/switch_target"
+  select_row "$(own_row)" || return 1
+  cs_activate_selected
+  [[ ! -f "${STATE_DIR}/switch_target" ]] || { fail "this project's own row hopped"; return 1; }
+
+  # With nothing shown the cursor goes back to this project, which is not at
+  # the top of the list: to its first session
+  cs_show_welcome
+  select_row bbbbbbb1 || return 1
+  cs_activate_selected
+  assert_eq "the cursor after a hop, nothing shown" "${ENTRIES_ID[${SELECTED}]}" "aaaaaaa1" || return 1
+
+  # and to its project row when it has no session
+  fake_drop aaaaaaa1
+  fake_drop aaaaaaa2
+  cs_poll 1 || { fail "second poll failed"; return 1; }
+  cs_rescan
+  select_row bbbbbbb1 || return 1
+  cs_activate_selected
+  assert_eq "the cursor after a hop, no session here" "${ENTRIES_ID[${SELECTED}]}" "$(own_row)"
 }
 
 # A session the launcher left in pending_load is shown, once, if it is this
@@ -1953,7 +2121,163 @@ test_pending_load_shows_session() {
 
   echo "bbbbbbb1" > "${STATE_DIR}/pending_load"
   cs_consume_pending_load
-  assert_eq "another project's session is not shown here" "${SHOWN}" ""
+  assert_eq "another project's session is not shown here" "${SHOWN}" "" || return 1
+
+  # a hop can ask for a new session, or for agent view, instead of a session
+  echo "new" > "${STATE_DIR}/pending_load"
+  cs_consume_pending_load
+  assert_eq "a new session was started" "$(cat "${FAKE_CLAUDE_DIR}/cmd.log" 2>/dev/null)" "bg --bg" || return 1
+  assert_eq "the new session is shown" "${SHOWN}" "f0000001" || return 1
+  [[ ! -f "${STATE_DIR}/pending_load" ]] || { fail "pending_load not consumed after a new session"; return 1; }
+  touch "${FAKE_CLAUDE_DIR}/slow_agents"
+  echo "agents" > "${STATE_DIR}/pending_load"
+  cs_consume_pending_load
+  assert_eq "agent view" "$(client_title)" "${CS_T_AGENTS}"
+}
+
+# New session and agent view act on the project under the cursor. On a row of
+# another project the picker hops there and leaves the command for that
+# project's picker: nothing is started here. A prefix key pressed from the
+# Claude pane means this project, wherever the cursor was left.
+test_route_actions() {
+  local other_row
+  other_row="__proj_$(cs_sanitize_path /work/other)__"
+  fake_add aaaaaaa1 done idle "mine"
+  fake_add bbbbbbb1 done idle "theirs" "/work/other"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  cs_show_session aaaaaaa1 || { fail "show failed"; return 1; }
+
+  # from the picker, on another project's session
+  _tmux select-pane -t "${PICKER_PANE}"
+  select_row bbbbbbb1 || return 1
+  cs_route_action new
+  assert_eq "new, on another project's session" "$(cat "${STATE_DIR}/switch_target" 2>/dev/null)" $'/work/other\nnew' || return 1
+  [[ ! -f "${FAKE_CLAUDE_DIR}/cmd.log" ]] || { fail "a session was started here: $(cat "${FAKE_CLAUDE_DIR}/cmd.log")"; return 1; }
+  assert_eq "the cursor after the hop" "${ENTRIES_ID[${SELECTED}]}" "aaaaaaa1" || return 1
+
+  # agent view, on another project's own row
+  rm -f "${STATE_DIR}/switch_target"
+  select_row "${other_row}" || return 1
+  cs_route_action agents
+  assert_eq "agent view, on another project's row" "$(cat "${STATE_DIR}/switch_target" 2>/dev/null)" $'/work/other\nagents' || return 1
+  assert_eq "what is shown here stays" "${SHOWN}" "aaaaaaa1" || return 1
+
+  # a prefix key pressed in the picker is the picker's own key
+  rm -f "${STATE_DIR}/switch_target"
+  select_row bbbbbbb1 || return 1
+  cs_route_action new 1
+  assert_eq "prefix c, in the picker" "$(cat "${STATE_DIR}/switch_target" 2>/dev/null)" $'/work/other\nnew' || return 1
+
+  # pressed from the Claude pane it means this project
+  rm -f "${STATE_DIR}/switch_target"
+  select_row bbbbbbb1 || return 1
+  _tmux select-pane -t "${CLIENT_PANE}"
+  cs_route_action new 1
+  [[ ! -f "${STATE_DIR}/switch_target" ]] || { fail "prefix c from the Claude pane hopped"; return 1; }
+  assert_eq "prefix c, from the Claude pane" "$(cat "${FAKE_CLAUDE_DIR}/cmd.log" 2>/dev/null)" "bg --bg" || return 1
+  assert_eq "the new session is shown" "${SHOWN}" "f0000001" || return 1
+
+  select_row bbbbbbb1 || return 1
+  _tmux select-pane -t "${CLIENT_PANE}"
+  touch "${FAKE_CLAUDE_DIR}/slow_agents"
+  cs_route_action agents 1
+  [[ ! -f "${STATE_DIR}/switch_target" ]] || { fail "prefix v from the Claude pane hopped"; return 1; }
+  assert_eq "prefix v, from the Claude pane" "$(client_title)" "${CS_T_AGENTS}" || return 1
+
+  # in the picker, on this project's own row, the command runs here
+  _tmux select-pane -t "${PICKER_PANE}"
+  select_row "$(own_row)" || return 1
+  cs_route_action new
+  [[ ! -f "${STATE_DIR}/switch_target" ]] || { fail "new on this project's row hopped"; return 1; }
+  assert_eq "new, on this project's row" "$(tail -1 "${FAKE_CLAUDE_DIR}/cmd.log")" "bg --bg"
+}
+
+# Stop and remove act on the session under the cursor, in this project or in
+# another, and the view stays where it is. The menu offers them there too. A
+# project row has nothing to stop.
+test_stop_remove_other_project() {
+  local other_row
+  other_row="__proj_$(cs_sanitize_path /work/other)__"
+  fake_add aaaaaaa1 done idle "mine"
+  fake_add bbbbbbb1 done idle "theirs" "/work/other"
+  fake_add bbbbbbb2 done idle "theirs too" "/work/other"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  cs_show_session aaaaaaa1 || { fail "show failed"; return 1; }
+  _tmux select-pane -t "${PICKER_PANE}"
+
+  select_row bbbbbbb1 || return 1
+  cs_menu_init
+  [[ " ${MENU_KEYS[*]} " == *" x "* && " ${MENU_KEYS[*]} " == *" D "* ]] \
+    || { fail "the menu has no Stop and Remove on another project's session: ${MENU_KEYS[*]}"; return 1; }
+  cs_confirm_end stop "Stop? y/N" <<< "y" > /dev/null
+  assert_eq "stopped" "$(cat "${FAKE_CLAUDE_DIR}/cmd.log" 2>/dev/null)" "stop bbbbbbb1" || return 1
+  assert_eq "footer" "${FOOTER_MSG}" "stopped bbbbbbb1" || return 1
+  [[ ! -f "${STATE_DIR}/switch_target" ]] || { fail "stopping another project's session hopped"; return 1; }
+  assert_eq "what is shown here, after the stop" "${SHOWN}" "aaaaaaa1" || return 1
+
+  : > "${FAKE_CLAUDE_DIR}/cmd.log"
+  select_row bbbbbbb2 || return 1
+  cs_confirm_end rm "Remove (stops work)? y/N" <<< "y" > /dev/null
+  assert_eq "removed" "$(cat "${FAKE_CLAUDE_DIR}/cmd.log")" "rm bbbbbbb2" || return 1
+  [[ " $(session_ids) " != *" bbbbbbb2 "* ]] || { fail "the removed session is still listed"; return 1; }
+  assert_eq "what is shown here, after the remove" "${SHOWN}" "aaaaaaa1" || return 1
+
+  # a project row is not a session
+  : > "${FAKE_CLAUDE_DIR}/cmd.log"
+  select_row "${other_row}" || return 1
+  cs_menu_init
+  [[ " ${MENU_KEYS[*]} " != *" x "* ]] || { fail "the menu has Stop on a project row"; return 1; }
+  cs_confirm_end stop "Stop? y/N" <<< "y" > /dev/null
+  [[ ! -s "${FAKE_CLAUDE_DIR}/cmd.log" ]] || { fail "a project row was stopped: $(cat "${FAKE_CLAUDE_DIR}/cmd.log")"; return 1; }
+}
+
+# When the row under the cursor goes away, the cursor is not left on the empty
+# row between two projects, where it cannot be seen. It goes up, to what is left
+# of the project the row was in: its last session, or its project row.
+test_cursor_leaves_empty_row() {
+  local now
+  now=$(date +%s)
+  fake_add aaaaaaa1 done idle "one"
+  fake_add aaaaaaa2 done idle "two"
+  fake_add bbbbbbb1 done idle "theirs" "/work/other"
+  fake_transcript aaaaaaa1 $((now - 3600))
+  fake_transcript aaaaaaa2 $((now - 7200))
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  # this project, its two sessions, an empty row, the other project, its session
+  select_row aaaaaaa2 || return 1
+  assert_eq "setup: the row under the last session" "${ENTRIES_TYPE[$((SELECTED + 1))]}" "spacer" || return 1
+  cs_confirm_end rm "Remove (stops work)? y/N" <<< "y" > /dev/null
+  assert_eq "the cursor after the last session of a project was removed" "${ENTRIES_ID[${SELECTED}]}" "aaaaaaa1" || return 1
+
+  # the same when it goes away somewhere else, and nothing is left but the project
+  fake_drop aaaaaaa1
+  cs_poll 1 || { fail "second poll failed"; return 1; }
+  cs_rescan
+  assert_eq "the cursor after the only session of a project went away" "${ENTRIES_ID[${SELECTED}]}" "$(own_row)"
+}
+
+# This project's row is bold wherever it is in the list, and another project's
+# is not. It tells the project a prefix key acts on from the rest.
+test_current_project_marked() {
+  fake_add aaaaaaa1 done idle "mine"
+  fake_add bbbbbbb1 done idle "theirs" "/work/other"
+  # the other project was active a moment ago: it is listed above this one
+  fake_transcript bbbbbbb1 $(($(date +%s) - 30))
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  # the cursor on a session: the selected row is bold whatever it is
+  select_row aaaaaaa1 || return 1
+  local -a row
+  # tmux writes bold on its own or after a reset: \e[1m, \e[0;1m
+  local bold=$'\e\\[([0-9]+;)*1(;[0-9]+)*m'
+  # 1 top bar, 2 the other project, 3 its session, 4 empty, 5 this project
+  screen_rows 40 20 colors
+  [[ "${row[5]}" =~ ${bold}project ]] || { fail "this project's row is not bold: $(printf '%q' "${row[5]}")"; return 1; }
+  [[ "${row[2]}" == *"other"* ]] || { fail "the other project is not on row 2: $(printf '%q' "${row[2]}")"; return 1; }
+  [[ ! "${row[2]}" =~ ${bold} ]] || { fail "another project's row is bold: $(printf '%q' "${row[2]}")"; return 1; }
 }
 
 # ── Tests: terminals ─────────────────────────────
@@ -2236,7 +2560,7 @@ test_term_stop_keeps_remove_kills() {
   show_with_terminal aaaaaaa1 bottom || { fail "setup failed"; return 1; }
   local tp
   tp=$(term_pane_of aaaaaaa1)
-  SELECTED=0
+  select_row aaaaaaa1 || return 1
   cs_confirm_end stop "Stop? y/N" <<< "y" > /dev/null
   pane_is_alive "${tp}" || { fail "stop killed the terminal"; return 1; }
   assert_eq "still tracked after stop" "$(term_pane_of aaaaaaa1)" "${tp}" || return 1
@@ -2489,7 +2813,9 @@ test_symlinked_cwd_finds_sessions() {
   assert_eq "PWD normalized" "${PWD}" "${real_canonical}" || rc=1
   cs_poll 1 || rc=1
   cs_rescan
-  assert_eq "listed" "${ENTRIES_ID[*]} ${ENTRIES_TYPE[*]}" "aaaaaaa1 local" || rc=1
+  local idx
+  cs_find_entry_index aaaaaaa1 idx
+  assert_eq "listed, as this project's" "$(session_ids) ${ENTRIES_TYPE[${idx}]:-}" "aaaaaaa1 local" || rc=1
   cd "${saved_cwd}" || return 1
   PWD="${saved_pwd}"
   rm -rf "${real_dir}" "${link_dir}"
@@ -2538,6 +2864,38 @@ test_sort_memo() {
   expect=$(printf '%s\n' "${nums[@]}" | sort -rnk1)
   cs_sort_memo out n "${in}" -rnk1
   [[ "${out}" == "${expect}" ]] || { fail "numeric: output differs from sort"; return 1; }
+}
+
+# Every project's sessions are sorted, and each project has a memo of its own:
+# a second look at a list that did not change runs no sort at all.
+test_sort_memo_per_project() {
+  local now p i
+  now=$(date +%s)
+  for p in a b; do
+    for i in 1 2 3; do
+      fake_add "${p}${p}${p}${p}${p}${p}${p}${i}" done idle "session ${i}" "/work/${p}"
+      fake_transcript "${p}${p}${p}${p}${p}${p}${p}${i}" $((now - 3600 * i))
+    done
+  done
+  fake_add ccccccc1 done idle "mine, older"
+  fake_add ccccccc2 done idle "mine, newer"
+  fake_transcript ccccccc1 $((now - 9000))
+  fake_transcript ccccccc2 $((now - 8000))
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  local calls="${TEST_TMP}/sort-calls"
+  : > "${calls}"
+  sort() {
+    echo x >> "${calls}"
+    command sort "$@"
+  }
+  cs_rescan
+  local first
+  first=$(wc -l < "${calls}" | tr -d ' ')
+  : > "${calls}"
+  cs_rescan
+  unset -f sort
+  ((first > 0)) || { fail "the first look at the list sorted nothing"; return 1; }
+  assert_eq "sorts on a second look at the same list" "$(wc -l < "${calls}" | tr -d ' ')" "0"
 }
 
 # One tmux call gives the live panes, the picker's focus, the number of attached
@@ -2939,8 +3297,9 @@ test_e2e_hop() {
     sleep 0.1
   done
   e2e_picker_text a | grep -q "Over there" || { fail "the other project's session is not listed"; return 1; }
-  # the cursor starts on the project row; the session is the next one
-  e2e_keys a j Enter
+  # the cursor starts on this project's row; then the other project's row, then
+  # its session
+  e2e_keys a j j Enter
   e2e_wait_up b || { fail "the other project's view never came up: $(e2e_outer_text | tail -3)"; return 1; }
   local stb
   stb=$(e2e_state b)
@@ -2953,6 +3312,81 @@ test_e2e_hop() {
   [[ ! -f "${stb}/pending_load" ]] || { fail "pending_load was not consumed"; return 1; }
   [[ ! -f "$(e2e_state a)/switch_target" ]] || { fail "switch_target was not consumed"; return 1; }
   tmux -L "$(e2e_inner a)" has-session 2>/dev/null || { fail "the first project's server was ended by the hop"; return 1; }
+}
+
+# New session with the cursor on another project: the picker hops there, and
+# that project's picker starts the session, in its own directory.
+test_e2e_new_in_other_project() {
+  fake_add bbbbbbb1 done idle "Over there" "$(e2e_project b)"
+  e2e_launch a
+  e2e_wait_up a || { fail "the picker never came up"; return 1; }
+  local i
+  for ((i = 0; i < 40; i++)); do
+    e2e_picker_text a | grep -q "Over there" && break
+    sleep 0.1
+  done
+  e2e_picker_text a | grep -q "Over there" || { fail "the other project's session is not listed"; return 1; }
+  # the cursor starts on this project's row; the other project's is the next
+  e2e_keys a j : c
+  e2e_wait_up b || { fail "the other project's view never came up: $(e2e_outer_text | tail -3)"; return 1; }
+  local stb
+  stb=$(e2e_state b)
+  for ((i = 0; i < 80; i++)); do
+    [[ "$(cat "${stb}/displayed" 2>/dev/null)" == "f0000001" ]] && break
+    sleep 0.1
+  done
+  assert_eq "the new session, displayed in the other project" "$(cat "${stb}/displayed" 2>/dev/null)" "f0000001" || return 1
+  assert_eq "started once" "$(grep -c '^bg ' "${FAKE_CLAUDE_DIR}/cmd.log")" "1" || return 1
+  assert_eq "started in the other project" \
+    "$(jq -r '.[] | select(.id == "f0000001") | .cwd' "${FAKE_CLAUDE_DIR}/list.json")" "$(e2e_project b)" || return 1
+  [[ ! -f "${stb}/pending_load" ]] || { fail "pending_load was not consumed"; return 1; }
+  [[ ! -f "$(e2e_state a)/switch_target" ]] || { fail "switch_target was not consumed"; return 1; }
+}
+
+# Shutdown closes every view, not only the one it is asked in: the other
+# project's server and its state go too. Nothing else under the state root is
+# touched, and Claude is not asked to stop anything.
+test_e2e_shutdown_closes_every_view() {
+  # This test shuts down every view it finds. It must never find the user's.
+  [[ "${TMUX_TMPDIR:-}" == "${TEST_TMP}/"* ]] \
+    || { fail "the tests share tmux's socket directory with the user's views"; return 1; }
+  fake_add bbbbbbb1 done idle "Over there" "$(e2e_project b)"
+  e2e_launch a
+  e2e_wait_up a || { fail "the picker never came up"; return 1; }
+  local i
+  for ((i = 0; i < 40; i++)); do
+    e2e_picker_text a | grep -q "Over there" && break
+    sleep 0.1
+  done
+  e2e_picker_text a | grep -q "Over there" || { fail "the other project's session is not listed"; return 1; }
+  e2e_keys a j j Enter
+  e2e_wait_up b || { fail "the other project's view never came up: $(e2e_outer_text | tail -3)"; return 1; }
+  tmux -L "$(e2e_inner a)" has-session 2>/dev/null || { fail "setup: the first view is gone"; return 1; }
+  [[ -S "${TMUX_TMPDIR}/tmux-$(id -u)/$(e2e_inner a)" ]] \
+    || { fail "the views are not in the tests' own socket directory"; return 1; }
+  local root="${TEST_TMP}/e2e/run/claude-spaces-agents"
+  mkdir -p "${root}/not-a-view"
+  echo keep > "${root}/not-a-view/file"
+
+  # prefix s, then yes: asked in the second project's view
+  e2e_keys b C-v y
+  for ((i = 0; i < 80; i++)); do
+    tmux -L "$(e2e_inner b)" has-session 2>/dev/null || break
+    sleep 0.1
+  done
+  if tmux -L "$(e2e_inner b)" has-session 2>/dev/null; then
+    fail "the view shutdown was asked in is still up"
+    return 1
+  fi
+  if tmux -L "$(e2e_inner a)" has-session 2>/dev/null; then
+    fail "another project's view survived the shutdown"
+    return 1
+  fi
+  [[ ! -d "$(e2e_state a)" ]] || { fail "another project's state is left behind"; return 1; }
+  [[ ! -d "$(e2e_state b)" ]] || { fail "the state of the view shutdown was asked in is left behind"; return 1; }
+  [[ -f "${root}/not-a-view/file" ]] || { fail "a directory that is no view's state was removed"; return 1; }
+  [[ ! -f "${FAKE_CLAUDE_DIR}/cmd.log" ]] || { fail "Claude was asked to end something: $(cat "${FAKE_CLAUDE_DIR}/cmd.log")"; return 1; }
+  e2e_wait_outer "launcher exit=" || { fail "the launcher did not return to the shell"; return 1; }
 }
 
 # ── Main ─────────────────────────────────────────
@@ -2981,7 +3415,9 @@ main() {
   run_test "name control chars stripped"    test_name_control_chars_stripped
   run_test "poll failure keeps list"        test_poll_failure_keeps_list
   run_test "order and names"                test_order_and_names
-  run_test "other projects rows"            test_other_projects_rows
+  run_test "project rows"                   test_project_rows
+  run_test "project order"                  test_project_order
+  run_test "same list from any project"     test_same_list_from_any_project
   run_test "jump slots"                     test_jump_slots
   run_test "jump numbers drawn"             test_jump_numbers_drawn
   run_test "jump key hops"                  test_jump_key_hops
@@ -3011,10 +3447,13 @@ main() {
   run_test "stop shows feedback"            test_stop_shows_feedback
   run_test "remove drops the row"           test_remove_drops_the_row
   run_test "prefix stop targets shown"      test_prefix_stop_targets_shown
+  run_test "stop, remove in another project" test_stop_remove_other_project
   run_test "shutdown prompt"                test_shutdown_prompt
 
   run_test "footer note"                    test_footer_note
-  run_test "empty list note"                test_empty_list_note
+  run_test "no sessions view"               test_no_sessions_view
+  run_test "current project marked"         test_current_project_marked
+  run_test "cursor leaves an empty row"     test_cursor_leaves_empty_row
   run_test "dim is grey"                    test_dim_is_grey
   run_test "search cursor cell"             test_search_cursor_cell
 
@@ -3024,6 +3463,7 @@ main() {
   run_test "seen sweep"                     test_seen_sweep
 
   run_test "hop writes switch_target"       test_hop_writes_switch_target
+  run_test "commands follow the cursor"     test_route_actions
   run_test "pending_load shows session"     test_pending_load_shows_session
 
   run_test "term opens in session cwd"      test_term_opens_in_session_cwd
@@ -3054,6 +3494,7 @@ main() {
   run_test "symlinked cwd finds sessions"   test_symlinked_cwd_finds_sessions
   run_test "out-var helpers"                test_out_var_helpers
   run_test "sort memo"                      test_sort_memo
+  run_test "sort memo per project"          test_sort_memo_per_project
   run_test "pane cache"                     test_pane_cache
   run_test "poll only while attached"       test_poll_only_while_attached
   run_test "poll cache shared"              test_poll_cache_shared
@@ -3074,6 +3515,8 @@ main() {
   run_test "compatibility gate"             test_e2e_compat_gate
   run_test "parking keeps terminal size"    test_e2e_parking_keeps_terminal_size
   run_test "hop to another project"         test_e2e_hop
+  run_test "new session in another project" test_e2e_new_in_other_project
+  run_test "shutdown closes every view"     test_e2e_shutdown_closes_every_view
 
   echo ""
   echo "══════════════════════════════════"

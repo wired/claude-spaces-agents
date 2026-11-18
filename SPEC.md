@@ -634,6 +634,9 @@ roughly 15% of a core per picker.
 - **Removing a session on stale state.** `claude rm` stops work without asking. Check on a fresh
   poll, right before the call.
 - **`--cwd` for scoping.** It is a prefix match.
+- **Codes mosh drops.** mosh passes neither the dim attribute (SGR 2) nor a cursor colour (OSC 12
+  and 112). So the dim look is a grey foreground, and the search field's cursor is a drawn cell,
+  there only while the picker is the active pane (§ Verified).
 
 ## Dropped from claude-spaces
 
@@ -708,6 +711,7 @@ Checked on Claude Code 2.1.325, with throwaway background sessions in an isolate
 | Transcript | The mtime fails as an activity time: it moved on stop and on restart with no conversation activity. The records carry their own timestamps, and the last `user`, `assistant` or `turn_duration` record gives the real time. Reading it from the final 256 KB of a 4.8 MB transcript took 5 ms. A session with no prompt yet has no transcript. |
 | `startedAt` | The process start. It changed when a stopped session was woken. |
 | Two clients on one session | Both stay attached and mirror the session. It has one size, which followed the second client. |
+| mosh | Checked on mosh 1.4.0 with tmux 3.7c, by recording what mosh-client writes. Dropped: SGR 2 (dim), and OSC 12 and 112 (cursor colour). tmux does not ask a mosh client for extended keys, and mosh drops the request when it is sent directly. Passed: the other attributes, 256 colours, cursor movement, `?25h` and `?25l`, focus events. On an 8-colour terminal tmux sends grey 245 as white, the 237 selection bar as black, and dim as dim. |
 
 Not verified:
 

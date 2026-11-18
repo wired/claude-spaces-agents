@@ -570,6 +570,54 @@ load_breaks << 'BREAKS'
 @@ a note is drawn over the second row of a failing poll | test_empty_list_note
 -       empty_note_row=4
 
+@@ a row with no process is drawn with the dim attribute | test_dim_is_grey
+- CS_CLR_DORMANT='\e[38;5;245m'
++ CS_CLR_DORMANT='\e[2m'
+
+@@ the footer is drawn with the dim attribute | test_dim_is_grey
+- CS_CLR_CHROME='\e[38;5;245m'
++ CS_CLR_CHROME='\e[2m'
+
+@@ the section header is drawn with the dim attribute | test_dim_is_grey
+- CS_CLR_SECTION='\e[1;38;5;245m'
++ CS_CLR_SECTION='\e[2;1m'
+
+@@ a row with a process is drawn with the dim attribute | test_dim_is_grey
+- CS_CLR_RUNNING=''
++ CS_CLR_RUNNING='\e[2m'
+
+@@ the search field has no cursor | test_search_cursor_cell
+-       printf '\e[1;%dH\e[48;5;231m \e[0m' "${cur_col}"
++       :
+
+@@ the search cursor is drawn while the results have the keys | test_search_cursor_cell
+-     if ((SEARCH_FIELD_FOCUSED)) && [[ "${picker_focused}" == "1" ]] && ((cur_col <= width)); then
++     if [[ "${picker_focused}" == "1" ]] && ((cur_col <= width)); then
+
+@@ the search cursor is drawn while the picker is not the active pane | test_search_cursor_cell
+-     if ((SEARCH_FIELD_FOCUSED)) && [[ "${picker_focused}" == "1" ]] && ((cur_col <= width)); then
++     if ((SEARCH_FIELD_FOCUSED)) && ((cur_col <= width)); then
+
+@@ the search cursor is drawn over the end of a term that fills the pane | test_search_cursor_cell
+-     if ((SEARCH_FIELD_FOCUSED)) && [[ "${picker_focused}" == "1" ]] && ((cur_col <= width)); then
++     if ((SEARCH_FIELD_FOCUSED)) && [[ "${picker_focused}" == "1" ]]; then
+
+@@ the cursor colour is reset on every draw | test_search_cursor_cell
+-   # Hide cursor, home position (no full clear — paint over to avoid flash)
+-   printf '\e[?25l\e[H'
++   # Hide cursor, home position (no full clear — paint over to avoid flash)
++   printf '\e[?25l\e]112\a\e[H'
+
+@@ the search cursor is the terminal's own, with its colour set | test_search_cursor_cell
+-       printf '\e[1;%dH\e[48;5;231m \e[0m' "${cur_col}"
++       printf '\e[1;%dH\e[48;5;231m \e[0m' "${cur_col}"
++       printf '\e]12;#ffffff\a\e[1;%dH\e[?25h' "${cur_col}"
+
+@@ the terminal's cursor is shown on the search field | test_search_cursor_cell
+-       printf '\e[1;%dH\e[48;5;231m \e[0m' "${cur_col}"
++       printf '\e[1;%dH\e[48;5;231m \e[0m' "${cur_col}"
++       printf '\e[?25h'
+
 # ── attention ────────────────────────────────────
 
 @@ a session never shown is flagged | test_unseen_rules

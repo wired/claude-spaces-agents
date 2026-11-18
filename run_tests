@@ -1729,6 +1729,77 @@ test_empty_list_note() {
   assert_eq "no columns" "${parts[*]}" "a b"
 }
 
+# mosh drops the dim attribute, so what used to be dim is drawn in a grey: a row
+# with no process, the footer, the header of the other projects. Nothing on the
+# screen carries the attribute.
+test_dim_is_grey() {
+  local now
+  now=$(date +%s)
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done "" "asleep"
+  fake_add bbbbbbb1 done idle "theirs" "/work/other"
+  fake_transcript aaaaaaa1 $((now - 7200))
+  fake_transcript aaaaaaa2 $((now - 10800))
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  local -a row
+  local grey=$'\e\\[38;5;245m[^\e]*'
+  local section=$'\e\\[1m\e\\[38;5;245m─ other projects ─'
+  local dim=$'\e\\[([0-9];)*2(;[0-9])*m'
+  local i
+  # 1 header, 2 alpha (selected), 3 asleep, 4 empty, 5 "other projects",
+  # 6 the project, 7 its session, 8 empty, 9-10 key hints, 11 empty, 12 the version
+  screen_rows 40 20 colors
+  [[ "${row[3]}" =~ ${grey}asleep ]] || { fail "a row with no process is not grey: $(printf '%q' "${row[3]}")"; return 1; }
+  [[ "${row[10]}" =~ ${grey}Q:detach ]] || { fail "the key hints are not grey: $(printf '%q' "${row[10]}")"; return 1; }
+  [[ "${row[5]}" =~ ${section} ]] || { fail "the section header is not bold and grey: $(printf '%q' "${row[5]}")"; return 1; }
+  for ((i = 1; i < ${#row[@]}; i++)); do
+    [[ "${row[i]}" =~ ${dim} ]] && { fail "row ${i} carries the dim attribute: $(printf '%q' "${row[i]}")"; return 1; }
+  done
+  return 0
+}
+
+# The search field's cursor is a white cell drawn after the term. mosh drops the
+# sequence that colours the terminal's own cursor, and that cursor is red on the
+# green bar. The cell is there only while the field has the keys and the picker
+# is the active pane, which is when tmux showed the cursor, and it never covers
+# the term.
+test_search_cursor_cell() {
+  fake_add aaaaaaa1 done idle "alpha"
+  fake_add aaaaaaa2 done idle "beta"
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  local -a row
+  local raw
+  local cell=$'/be(\e\\[[0-9;]*m)*\e\\[48;5;231m '
+  SEARCH_ACTIVE=1
+  SEARCH_TERM="be"
+  SEARCH_FIELD_FOCUSED=1
+  screen_rows 40 20 colors
+  [[ "${row[1]}" =~ ${cell} ]] || { fail "no cell right after the term: $(printf '%q' "${row[1]}")"; return 1; }
+
+  # what the picker writes, as screen_of_render gets it: none of it shows on a screen
+  raw=$(shopt -u checkwinsize; export COLUMNS=40 LINES=20; cs_picker_render)
+  [[ "${raw}" != *$'\e]112'* ]] || { fail "the cursor colour is reset"; return 1; }
+  [[ "${raw}" != *$'\e]12;'* ]] || { fail "the cursor colour is set"; return 1; }
+  [[ "${raw}" != *$'\e[?25h'* ]] || { fail "the terminal's cursor is shown"; return 1; }
+
+  SEARCH_FIELD_FOCUSED=0
+  screen_rows 40 20 colors
+  [[ "${row[1]}" != *$'\e[48;5;231m'* ]] || { fail "a cell while the results have the keys: $(printf '%q' "${row[1]}")"; return 1; }
+
+  SEARCH_FIELD_FOCUSED=1
+  cs_read_state_into CLIENT_PANE client_pane
+  _tmux select-pane -t "${CLIENT_PANE}"
+  screen_rows 40 20 colors
+  _tmux select-pane -t "${PICKER_PANE}"
+  [[ "${row[1]}" != *$'\e[48;5;231m'* ]] || { fail "a cell while the picker is not the active pane: $(printf '%q' "${row[1]}")"; return 1; }
+
+  SEARCH_TERM="0123456789012345678901234567890123456789"
+  screen_rows 40 20 colors
+  [[ "${row[1]}" != *$'\e[48;5;231m'* ]] || { fail "a cell over a term that fills the pane: $(printf '%q' "${row[1]}")"; return 1; }
+}
+
 # ── Tests: attention ─────────────────────────────
 
 # Finished, unseen: by the time the last turn ended, read from the transcript,
@@ -2944,6 +3015,8 @@ main() {
 
   run_test "footer note"                    test_footer_note
   run_test "empty list note"                test_empty_list_note
+  run_test "dim is grey"                    test_dim_is_grey
+  run_test "search cursor cell"             test_search_cursor_cell
 
   run_test "unseen rules"                   test_unseen_rules
   run_test "mark seen clears unseen"        test_mark_seen_clears_unseen

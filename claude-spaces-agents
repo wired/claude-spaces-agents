@@ -1143,6 +1143,11 @@ cs_rescan() {
     if ((SELECTED >= n && n > 0)); then
       SELECTED=$((n - 1))
     fi
+    # The row is gone, and what took its place can be the empty row between
+    # two projects. Go up: the row before an empty one never is.
+    while [[ "${ENTRIES_TYPE[${SELECTED}]}" == "header" || "${ENTRIES_TYPE[${SELECTED}]}" == "spacer" ]] && ((SELECTED > 0)); do
+      ((SELECTED--))
+    done
   fi
   if ((SEARCH_ACTIVE)); then
     cs_search_apply_filter

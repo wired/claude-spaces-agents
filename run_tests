@@ -2233,6 +2233,32 @@ test_stop_remove_other_project() {
   [[ ! -s "${FAKE_CLAUDE_DIR}/cmd.log" ]] || { fail "a project row was stopped: $(cat "${FAKE_CLAUDE_DIR}/cmd.log")"; return 1; }
 }
 
+# When the row under the cursor goes away, the cursor is not left on the empty
+# row between two projects, where it cannot be seen. It goes up, to what is left
+# of the project the row was in: its last session, or its project row.
+test_cursor_leaves_empty_row() {
+  local now
+  now=$(date +%s)
+  fake_add aaaaaaa1 done idle "one"
+  fake_add aaaaaaa2 done idle "two"
+  fake_add bbbbbbb1 done idle "theirs" "/work/other"
+  fake_transcript aaaaaaa1 $((now - 3600))
+  fake_transcript aaaaaaa2 $((now - 7200))
+  cs_poll 1 || { fail "poll failed"; return 1; }
+  cs_rescan
+  # this project, its two sessions, an empty row, the other project, its session
+  select_row aaaaaaa2 || return 1
+  assert_eq "setup: the row under the last session" "${ENTRIES_TYPE[$((SELECTED + 1))]}" "spacer" || return 1
+  cs_confirm_end rm "Remove (stops work)? y/N" <<< "y" > /dev/null
+  assert_eq "the cursor after the last session of a project was removed" "${ENTRIES_ID[${SELECTED}]}" "aaaaaaa1" || return 1
+
+  # the same when it goes away somewhere else, and nothing is left but the project
+  fake_drop aaaaaaa1
+  cs_poll 1 || { fail "second poll failed"; return 1; }
+  cs_rescan
+  assert_eq "the cursor after the only session of a project went away" "${ENTRIES_ID[${SELECTED}]}" "$(own_row)"
+}
+
 # This project's row is bold wherever it is in the list, and another project's
 # is not. It tells the project a prefix key acts on from the rest.
 test_current_project_marked() {
@@ -3427,6 +3453,7 @@ main() {
   run_test "footer note"                    test_footer_note
   run_test "no sessions view"               test_no_sessions_view
   run_test "current project marked"         test_current_project_marked
+  run_test "cursor leaves an empty row"     test_cursor_leaves_empty_row
   run_test "dim is grey"                    test_dim_is_grey
   run_test "search cursor cell"             test_search_cursor_cell
 

@@ -539,6 +539,13 @@ load_breaks << 'BREAKS'
 -         if ((!SHOW_INDEX)); then
 +         if [[ "${entry_type}" == "remote" ]] && ((!SHOW_INDEX)); then
 
+@@ the cursor is left on the empty row between two projects | test_cursor_leaves_empty_row
+-     # The row is gone, and what took its place can be the empty row between
+-     # two projects. Go up: the row before an empty one never is.
+-     while [[ "${ENTRIES_TYPE[${SELECTED}]}" == "header" || "${ENTRIES_TYPE[${SELECTED}]}" == "spacer" ]] && ((SELECTED > 0)); do
+-       ((SELECTED--))
+-     done
+
 @@ this project's row is drawn like any other project's | test_current_project_marked
 -         [[ "${ENTRIES_PATH[${i}]}" == "${PWD}" ]] && line_color="${CS_CLR_BOLD}"
 

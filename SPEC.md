@@ -350,6 +350,10 @@ terminal window and hops between projects, that order changed at every hop.
   exception, and a short one: it makes a row not dim, so a session shown here whose new process
   is not listed yet sorts as not dim in this picker only, until the next poll.
 
+- **The cursor never rests on the empty row between two projects.** When the row under it goes
+  away and the empty row is what takes its place, the cursor goes up to the row before: the
+  last session left in that project, or its project row.
+
 There is no inactive section. To work in a folder that has no sessions, run
 `claude-spaces-agents` there.
 

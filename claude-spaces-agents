@@ -98,10 +98,10 @@ CS_CLR_HEADER_BG='\e[7m'
 CS_CLR_ACTIVE='\e[1;32m'
 CS_CLR_BELL='\e[31m'
 CS_CLR_RUNNING=''
-CS_CLR_DORMANT='\e[2m'
+CS_CLR_DORMANT='\e[38;5;245m'
 CS_CLR_SELECTION='\e[48;5;237m'
-CS_CLR_CHROME='\e[2m'
-CS_CLR_SECTION='\e[2;1m'
+CS_CLR_CHROME='\e[38;5;245m'
+CS_CLR_SECTION='\e[1;38;5;245m'
 CS_CLR_PROMPT_WARN='\e[33m'
 CS_CLR_PROMPT_DANGER='\e[31;1m'
 CS_CLR_BELL_MENU='\e[1;33m'
@@ -294,10 +294,10 @@ cs_create_default_config() {
 # color_active=\e[1;32m
 # color_bell=\e[31m
 # color_running=
-# color_dormant=\e[2m
+# color_dormant=\e[38;5;245m
 # color_selection=\e[48;5;237m
-# color_chrome=\e[2m
-# color_section=\e[2;1m
+# color_chrome=\e[38;5;245m
+# color_section=\e[1;38;5;245m
 # color_prompt_warn=\e[33m
 # color_prompt_danger=\e[31;1m
 # color_bell_menu=\e[1;33m
@@ -2601,13 +2601,20 @@ cs_picker_render() {
   fi
 
   # Hide cursor, home position (no full clear — paint over to avoid flash)
-  printf '\e[?25l\e]112\a\e[H'
+  printf '\e[?25l\e[H'
+
+  local picker_focused
+  picker_focused=$(_tmux display-message -t "${PICKER_PANE}" -p '#{pane_active}' 2>/dev/null || echo "1")
 
   # Header (or search bar when searching)
   if ((SEARCH_ACTIVE)); then
     local search_clr="${CS_CLR_SEARCH_BAR}"
     ((!SEARCH_FIELD_FOCUSED)) && search_clr="${CS_CLR_HEADER_BG}"
     cs_render_header_bar "${search_clr}" "/${SEARCH_TERM}" "${width}"
+    local cur_col=$((2 + ${#SEARCH_TERM}))
+    if ((SEARCH_FIELD_FOCUSED)) && [[ "${picker_focused}" == "1" ]] && ((cur_col <= width)); then
+      printf '\e[1;%dH\e[48;5;231m \e[0m' "${cur_col}"
+    fi
   else
     cs_render_header "${width}"
   fi
@@ -2634,23 +2641,13 @@ cs_picker_render() {
       empty_note_row=4
     fi
     cs_render_note "${empty_note_row}" "${width}" "${FOOTER_MSG}" || true
-    if ((SEARCH_ACTIVE)); then
-      printf '\e[%d;1H\e[K' "${height}"
-      if ((SEARCH_FIELD_FOCUSED)); then
-        printf '\e]12;#ffffff\a\e[1;%dH\e[?25h' "$((2 + ${#SEARCH_TERM}))"
-      fi
-    else
-      printf '\e[%d;1H\e[K' "${height}"
-    fi
+    printf '\e[%d;1H\e[K' "${height}"
     return
   fi
 
   # Session list
   local max_name=$((width - 4))
   ((max_name < 5)) && max_name=5
-
-  local picker_focused
-  picker_focused=$(_tmux display-message -t "${PICKER_PANE}" -p '#{pane_active}' 2>/dev/null || echo "1")
 
   cs_compute_jump_slots
   local i
@@ -2788,9 +2785,6 @@ cs_picker_render() {
     for ((cl = last_entry_line + 2; cl <= height; cl++)); do
       printf '\e[%d;1H\e[K' "${cl}"
     done
-    if ((SEARCH_FIELD_FOCUSED)); then
-      printf '\e]12;#ffffff\a\e[1;%dH\e[?25h' "$((2 + ${#SEARCH_TERM}))"
-    fi
   else
     # Centered footer (context-sensitive)
     local footer_line=$((last_entry_line + 2))

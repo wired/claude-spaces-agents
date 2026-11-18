@@ -107,6 +107,8 @@ CS_CLR_PROMPT_DANGER='\e[31;1m'
 CS_CLR_BELL_MENU='\e[1;33m'
 CS_CLR_SEARCH_BAR='\e[30;42m'
 CS_CLR_BOLD='\e[1m'
+# What a hop can ask the target's picker to do, besides showing a session
+ACTION_RE='^(new|agents)$'
 # Values from `claude agents --json` are checked against these before use
 ID_RE='^[0-9a-f]{8}$'
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
@@ -219,8 +221,10 @@ cs_create_default_config() {
 # Picker pane width: characters (e.g. 30) or percentage (e.g. 20%)
 # picker_width=30
 
-# Sessions active within this many minutes sort at the top (the ones that are
-# not dim first, then by name); the rest sort by most recent activity below them.
+# Sessions active within this many minutes sort at the top of their project
+# (the ones that are not dim first, then by name); the rest sort by most recent
+# activity below them. Projects sort the same way: the ones with such a session
+# first, by name, then the rest by most recent activity.
 # recent_threshold=10
 
 # Picker pane position: "right" (default) or "left"
@@ -890,18 +894,19 @@ cs_sort_memo() {
   printf -v "${_out}" '%s' "${_so}"
 }
 
-# Sessions active within recent_threshold minutes first: the ones that are not
-# dim, then by name. Then the rest, most recent first. Ended sessions (failed,
-# stopped) always sort with the rest.
+# Sort one project's sessions: the rows from index $1 to the end, memoized under
+# $2. Sessions active within recent_threshold minutes first: the ones that are
+# not dim, then by name. Then the rest, most recent first. Ended sessions
+# (failed, stopped) always sort with the rest. The lines that are sorted carry a
+# row's place within its project, so a project keeps its order wherever it is
+# in the list.
 cs_sort_entries() {
+  local start="$1" key="$2"
   local n=${#ENTRIES_ID[@]}
-  local now
-  printf -v now '%(%s)T' -1
-  RECENT_CUTOFF=$((now - RECENT_THRESHOLD * 60))
-  ((n <= 1)) && return 0
+  ((n - start <= 1)) && return 0
 
   local recent_indices=() older_indices=() i
-  for ((i = 0; i < n; i++)); do
+  for ((i = start; i < n; i++)); do
     case "${ENTRIES_STATUS[i]}" in
       failed|stopped)
         older_indices+=("${i}")
@@ -924,9 +929,9 @@ cs_sort_entries() {
       rank=1
       cs_row_look look "${ENTRIES_ID[${i}]}" "${ENTRIES_STATUS[${i}]}"
       [[ "${look}" != "dormant" ]] && rank=0
-      _rin+="${_rin:+$'\n'}${i} ${rank} ${ENTRIES_NAME[${i}],,}"
+      _rin+="${_rin:+$'\n'}$((i - start)) ${rank} ${ENTRIES_NAME[${i}],,}"
     done
-    cs_sort_memo sorted_recent recent "${_rin}" -t' ' -k2,2 -k3
+    cs_sort_memo sorted_recent "recent:${key}" "${_rin}" -t' ' -k2,2 -k3
   fi
 
   # Sort older by last activity, descending
@@ -934,15 +939,20 @@ cs_sort_entries() {
   if ((${#older_indices[@]} > 0)); then
     local _oin=""
     for i in "${older_indices[@]}"; do
-      _oin+="${_oin:+$'\n'}${ENTRIES_MTIME[${i}]} ${i}"
+      _oin+="${_oin:+$'\n'}${ENTRIES_MTIME[${i}]} $((i - start))"
     done
-    cs_sort_memo sorted_older older "${_oin}" -rnk1
+    cs_sort_memo sorted_older "older:${key}" "${_oin}" -rnk1
   fi
 
-  local new_id=() new_name=() new_mtime=() new_status=() new_sid=() new_type=() new_path=()
+  # the rows above this project stay as they are
+  local new_id=("${ENTRIES_ID[@]:0:start}") new_name=("${ENTRIES_NAME[@]:0:start}")
+  local new_mtime=("${ENTRIES_MTIME[@]:0:start}") new_status=("${ENTRIES_STATUS[@]:0:start}")
+  local new_sid=("${ENTRIES_SID[@]:0:start}") new_type=("${ENTRIES_TYPE[@]:0:start}")
+  local new_path=("${ENTRIES_PATH[@]:0:start}")
   local idx
   if [[ -n "${sorted_recent}" ]]; then
     while read -r idx _; do
+      idx=$((idx + start))
       new_id+=("${ENTRIES_ID[${idx}]}")
       new_name+=("${ENTRIES_NAME[${idx}]}")
       new_mtime+=("${ENTRIES_MTIME[${idx}]}")
@@ -954,6 +964,7 @@ cs_sort_entries() {
   fi
   if [[ -n "${sorted_older}" ]]; then
     while read -r _ idx; do
+      idx=$((idx + start))
       new_id+=("${ENTRIES_ID[${idx}]}")
       new_name+=("${ENTRIES_NAME[${idx}]}")
       new_mtime+=("${ENTRIES_MTIME[${idx}]}")
@@ -973,61 +984,94 @@ cs_sort_entries() {
   ENTRIES_PATH=("${new_path[@]}")
 }
 
-# Build the rows from the last list: this project's background sessions, then
-# the other projects that have any. A session inside <project>/.claude/worktrees/
-# belongs to <project>.
+# Build the rows from the last list: every project that has background sessions,
+# and this one even when it has none. Each is a project row, then its sessions.
+# Nothing a picker has of its own decides the order, so every project's picker
+# shows the same list. A session inside <project>/.claude/worktrees/ belongs to
+# <project>.
 cs_build_all_entries() {
   cs_entry_clear
+  local now
+  printf -v now '%(%s)T' -1
+  RECENT_CUTOFF=$((now - RECENT_THRESHOLD * 60))
   local id name mt proj
-  # other project → its session ids, space separated
-  local -A other=()
+  # project → its session ids, space separated
+  local -A sessions=()
+  sessions["${PWD}"]=""
   for id in "${AG_IDS[@]}"; do
     proj="${AG_CWD[${id}]%%/.claude/worktrees/*}"
-    if [[ "${proj}" != "${PWD}" ]]; then
-      [[ -n "${proj}" ]] && other["${proj}"]+="${id} "
-      continue
-    fi
-    cs_row_fields name mt "${id}"
-    cs_entry_append "${id}" "${name}" "${mt}" "${AG_STATE[${id}]}" "${AG_SID[${id}]}" "local" "${AG_CWD[${id}]}"
+    [[ -n "${proj}" ]] && sessions["${proj}"]+="${id} "
   done
-  cs_sort_entries
 
-  # Other projects: each one that has background sessions, then its sessions, most
-  # recent first. Selecting either hops to that project's own view.
   local projs="" sorted=""
-  for proj in "${!other[@]}"; do
+  for proj in "${!sessions[@]}"; do
+    [[ "${proj}" == "${PWD}" ]] && continue
     projs+="${projs:+$'\n'}${proj}"
   done
   [[ -n "${projs}" ]] && cs_sort_memo sorted projects "${projs}"
   cs_other_projects_names "${sorted}"
-  [[ -n "${sorted}" ]] || return 0
 
-  cs_entry_append "__spacer_remote__" "" "0" "" "" "spacer" ""
-  cs_entry_append "__hdr_remote__" "other projects" "0" "" "" "header" ""
-  local first=1 sanitized leaf lines order
-  while IFS= read -r proj; do
-    [[ -n "${proj}" ]] || continue
+  # A project is recent when one of its sessions sorts as recent. Recent projects
+  # come first, by name; the rest follow, most recent first. Both end on the
+  # path, so two projects never tie.
+  local sanitized leaf newest is_recent recent_in="" older_in=""
+  local -A leaves=()
+  for proj in "${!sessions[@]}"; do
     sanitized="${proj//\//-}"
     sanitized="${sanitized//_/-}"
     leaf="${PROJECT_NAMES[${sanitized}]:-${DISPLAY_NAMES[${proj}]:-${proj##*/}}}"
+    leaves["${proj}"]="${leaf}"
+    newest=0
+    is_recent=0
+    for id in ${sessions[${proj}]}; do
+      cs_row_fields name mt "${id}"
+      ((mt > newest)) && newest=${mt}
+      case "${AG_STATE[${id}]}" in
+        failed|stopped) ;;
+        *) ((mt >= RECENT_CUTOFF)) && is_recent=1 ;;
+      esac
+    done
+    # this project with no session yet: where its first one will put it
+    [[ -z "${sessions[${proj}]}" ]] && is_recent=1
+    if ((is_recent)); then
+      recent_in+="${recent_in:+$'\n'}${leaf,,}"$'\x1f'"${proj}"
+    else
+      older_in+="${older_in:+$'\n'}${newest}"$'\x1f'"${leaf,,}"$'\x1f'"${proj}"
+    fi
+  done
+  local order="" older=""
+  [[ -n "${recent_in}" ]] && cs_sort_memo order projects:recent "${recent_in}" -t$'\x1f' -k1,1 -k2
+  if [[ -n "${older_in}" ]]; then
+    cs_sort_memo older projects:older "${older_in}" -t$'\x1f' -k1,1rn -k2
+    order+="${order:+$'\n'}${older}"
+  fi
+
+  local first=1 start type path
+  while IFS= read -r proj; do
+    proj="${proj##*$'\x1f'}"
+    [[ -n "${proj}" ]] || continue
+    sanitized="${proj//\//-}"
+    sanitized="${sanitized//_/-}"
     if ((first)); then
       first=0
     else
       cs_entry_append "__spacer_proj_${sanitized}__" "" "0" "" "" "spacer" ""
     fi
-    cs_entry_append "__proj_${sanitized}__" "${leaf}" "0" "" "" "project" "${proj}"
-    lines=""
-    for id in ${other[${proj}]}; do
+    cs_entry_append "__proj_${sanitized}__" "${leaves[${proj}]}" "0" "" "" "project" "${proj}"
+    start=${#ENTRIES_ID[@]}
+    for id in ${sessions[${proj}]}; do
       cs_row_fields name mt "${id}"
-      lines+="${lines:+$'\n'}${mt} ${id}"
+      # A session of this project is shown here; any other hops to its project.
+      type="remote"
+      path="${proj}"
+      if [[ "${proj}" == "${PWD}" ]]; then
+        type="local"
+        path="${AG_CWD[${id}]}"
+      fi
+      cs_entry_append "${id}" "${name}" "${mt}" "${AG_STATE[${id}]}" "${AG_SID[${id}]}" "${type}" "${path}"
     done
-    cs_sort_memo order "remote:${proj}" "${lines}" -rnk1
-    while read -r _ id; do
-      [[ -n "${id}" ]] || continue
-      cs_row_fields name mt "${id}"
-      cs_entry_append "${id}" "${name}" "${mt}" "${AG_STATE[${id}]}" "${AG_SID[${id}]}" "remote" "${proj}"
-    done <<< "${order}"
-  done <<< "${sorted}"
+    cs_sort_entries "${start}" "${proj}"
+  done <<< "${order}"
 }
 
 # Name and last-activity time of session $3's row, into the variables named $1
@@ -1123,7 +1167,8 @@ MENU_KEYS=()
 MENU_LABELS=()
 
 cs_menu_init() {
-  if [[ "${ENTRIES_TYPE[${SELECTED}]:-}" == "local" ]]; then
+  # Stop and Remove are for a session, of this project or of another
+  if [[ "${ENTRIES_TYPE[${SELECTED}]:-}" == "local" || "${ENTRIES_TYPE[${SELECTED}]:-}" == "remote" ]]; then
     MENU_KEYS=(p x D "" c v d s)
     MENU_LABELS=(
       "Rename project"
@@ -2401,11 +2446,17 @@ cs_prefix_end() {
 # Run `claude stop` or `claude rm` on the selected session after a confirmation.
 # The command's own line goes to the footer: an idle session's row does not
 # change when it is stopped, and `claude rm` can refuse.
+# The session may be another project's. Claude takes the id, and that project's
+# picker finds out as it does when a session is ended from outside: it goes to
+# welcome if it was showing it, and sweeps the terminal once it polls again.
 cs_confirm_end() {
   local verb="$1" prompt="$2"
   local n=${#ENTRIES_ID[@]}
   ((n == 0)) && return 0
-  [[ "${ENTRIES_TYPE[${SELECTED}]}" == "local" ]] || return 0
+  case "${ENTRIES_TYPE[${SELECTED}]}" in
+    local|remote) ;;
+    *) return 0 ;;
+  esac
   local id="${ENTRIES_ID[${SELECTED}]}"
   [[ "${id}" =~ ${ID_RE} ]] || return 0
   cs_confirm "${CS_CLR_PROMPT_WARN}" "${prompt}" || return 0
@@ -2432,26 +2483,11 @@ cs_render_header_bar() {
   printf '\e[1;1H%b%s\e[0m' "${color}" "${text}"
 }
 
+# The top bar carries the version. The project is a row of the list.
 cs_render_header() {
   local width="$1"
-  local pname="${PROJECT_NAMES[${PWD_SANITIZED}]:-}"
-  local title_path
-  if [[ -n "${pname}" ]]; then
-    title_path="${pname}"
-  else
-    local dname="${DISPLAY_NAMES[${PWD}]:-}"
-    local leaf="${PWD##*/}"
-    if [[ -n "${dname}" && "${dname}" != "${leaf}" ]]; then
-      title_path="${dname}"
-    else
-      title_path="${PWD/#${HOME}/\~$(whoami)}"
-    fi
-  fi
-  local max_title=$((width - 2))
-  if ((${#title_path} > max_title)); then
-    title_path="...${title_path: -$((max_title - 3))}"
-  fi
-  local title=" ${title_path} "
+  local title=" spaces-agents v${VERSION} "
+  title="${title:0:width}"
   local pad=$(( (width - ${#title}) / 2 ))
   ((pad < 0)) && pad=0
   printf '\e[1;1H%b%*s\e[0m' "${CS_CLR_HEADER_BG}" "${width}" ""
@@ -2584,10 +2620,10 @@ cs_picker_render() {
   ((SEARCH_ACTIVE)) || note="${POLL_ERROR:-${FOOTER_MSG}}"
   cs_note_split note_rows "${note}" "${width}"
 
-  avail=$((height - 5))
-  # A note takes its one or two rows under the key hints and an empty row on
-  # either side, and the footer has one empty row to give. A list that fills the
-  # pane gives up the rest.
+  # The top bar, the scroll indicator and the two rows of key hints
+  avail=$((height - 4))
+  # A note takes its one or two rows under the key hints and an empty row above
+  # them. A list that fills the pane gives those up.
   ((${#note_rows[@]})) && avail=$((avail - ${#note_rows[@]} - 1))
   ((avail < 1)) && avail=1
 
@@ -2620,27 +2656,16 @@ cs_picker_render() {
   fi
 
   if ((n == 0)); then
+    # Only a search leaves no rows: the list always has this project's row, so
+    # a failing poll or a command's line has a footer to be shown in.
     local empty_msg=""
-    # a failing poll must never look like an empty list
-    [[ -n "${POLL_ERROR}" ]] && empty_msg="${POLL_ERROR}"
     ((SEARCH_ACTIVE)) && empty_msg="No matches."
-    local -a empty_rows
-    cs_note_split empty_rows "${empty_msg}" "$((width - 2))"
-    printf '\e[2;1H\e[K%b  %s\e[0m' "${CS_CLR_CHROME}" "${empty_rows[0]:-}"
+    printf '\e[2;1H\e[K%b  %s\e[0m' "${CS_CLR_CHROME}" "${empty_msg}"
     # Clear remaining lines
     local cl
     for ((cl = 3; cl < height; cl++)); do
       printf '\e[%d;1H\e[K' "${cl}"
     done
-    # The last command's own line. With no list there is no footer to show it
-    # in, and a failing poll already has the rows above: one, or two when it is
-    # split, and then the note starts a row lower.
-    local empty_note_row=3
-    if ((${#empty_rows[@]} > 1)); then
-      printf '\e[3;1H%b  %s\e[0m' "${CS_CLR_CHROME}" "${empty_rows[1]}"
-      empty_note_row=4
-    fi
-    cs_render_note "${empty_note_row}" "${width}" "${FOOTER_MSG}" || true
     printf '\e[%d;1H\e[K' "${height}"
     return
   fi
@@ -2703,9 +2728,9 @@ cs_picker_render() {
             line_prefix="< "
           fi
         fi
-        if [[ "${entry_type}" == "remote" ]] && ((!SHOW_INDEX)); then
-          # another project's session: indented under its project. With
-          # show_index on, its number or the two blanks stand in for the indent.
+        if ((!SHOW_INDEX)); then
+          # a session is indented under its project. With show_index on, its
+          # number or the two blanks stand in for the indent.
           [[ -n "${line_prefix}" ]] || indent=2
         elif ((SHOW_INDEX)); then
           if [[ -v "JUMP_SLOT[${i}]" ]]; then
@@ -2719,6 +2744,8 @@ cs_picker_render() {
         ;;
       project)
         line_color="${CS_CLR_RUNNING}" ; show_age=0
+        # this project's row stands out: it is where a prefix key acts
+        [[ "${ENTRIES_PATH[${i}]}" == "${PWD}" ]] && line_color="${CS_CLR_BOLD}"
         ;;
     esac
 
@@ -2789,7 +2816,9 @@ cs_picker_render() {
     # Centered footer (context-sensitive)
     local footer_line=$((last_entry_line + 2))
     local selected_type="${ENTRIES_TYPE[${SELECTED}]:-local}"
-    if [[ "${selected_type}" == "remote" || "${selected_type}" == "project" ]]; then
+    # Enter hops from another project's rows, not from this project's own
+    if [[ "${selected_type}" == "remote" || "${selected_type}" == "project" ]] \
+       && [[ "${ENTRIES_PATH[${SELECTED}]}" != "${PWD}" ]]; then
       cs_print_centered "${footer_line}" "Enter:switch" "${width}"
     else
       cs_print_centered "${footer_line}" ": menu  / search" "${width}"
@@ -2799,18 +2828,15 @@ cs_picker_render() {
     local quit_line=$((footer_line + 1))
     cs_print_centered "${quit_line}" "Q:detach  ?:help" "${width}"
 
-    # One empty row, then the version. A note goes between them, with an empty
-    # row of its own on either side.
-    local version_line=$((quit_line + 2))
+    # A note goes under the key hints, with an empty row above it.
+    local last_line=${quit_line}
     if cs_render_note "$((quit_line + 1))" "${width}" "${note}"; then
-      version_line=$((quit_line + 3 + ${#note_rows[@]}))
-    else
-      printf '\e[%d;1H\e[K' "$((quit_line + 1))"
+      last_line=$((quit_line + 1 + ${#note_rows[@]}))
     fi
-    cs_print_centered "${version_line}" "spaces-agents v${VERSION}" "${width}"
 
-    # Clear everything below
-    printf '\e[%d;1H\e[J' "$((version_line + 1))"
+    # Clear everything below. A row past the bottom would be taken for the last
+    # one, which is the footer's own when the list fills the pane.
+    ((last_line < height)) && printf '\e[%d;1H\e[J' "$((last_line + 1))"
   fi
 }
 
@@ -2884,8 +2910,8 @@ cs_picker_loop() {
           p) MENU_ACTIVE=0; cs_rename_project; DIRTY=1 ;;
           x) MENU_ACTIVE=0; cs_confirm_end stop "Stop? y/N"; DIRTY=1 ;;
           D) MENU_ACTIVE=0; cs_confirm_end rm "Remove (stops work)? y/N"; DIRTY=1 ;;
-          c) MENU_ACTIVE=0; cs_new_session && cs_focus_session; cs_select_shown; DIRTY=1 ;;
-          v) MENU_ACTIVE=0; cs_open_agents; DIRTY=1 ;;
+          c) MENU_ACTIVE=0; cs_route_action new ;;
+          v) MENU_ACTIVE=0; cs_route_action agents ;;
           d) MENU_ACTIVE=0; _tmux detach-client ;;
           s) MENU_ACTIVE=0; cs_confirm_shutdown; DIRTY=1 ;;
           *) MENU_ACTIVE=0; DIRTY=1 ;;
@@ -2973,11 +2999,11 @@ cs_picker_loop() {
           $'\x01') _tmux select-pane -t "${PICKER_PANE}"; cs_search_enter; DIRTY=1 ;;
           $'\x19') _tmux select-pane -t "${PICKER_PANE}"; cs_rename_project; DIRTY=1 ;;
           $'\x16') _tmux select-pane -t "${PICKER_PANE}"; cs_confirm_shutdown; DIRTY=1 ;;
-          $'\x02') _tmux select-pane -t "${PICKER_PANE}"; cs_new_session && cs_focus_session; cs_select_shown; DIRTY=1 ;;
+          $'\x02') cs_route_action new 1 ;;
           $'\x05') _tmux select-pane -t "${PICKER_PANE}"; cs_menu_enter ;;
           $'\x06') cs_prefix_end stop "Stop? y/N"; DIRTY=1 ;;
           $'\x14') cs_prefix_end rm "Remove (stops work)? y/N"; DIRTY=1 ;;
-          $'\x10') cs_open_agents; DIRTY=1 ;;
+          $'\x10') cs_route_action agents 1 ;;
           $'\x0e')
             _tmux select-pane -t "${PICKER_PANE}"
             stty echo 2>/dev/null || true
@@ -3100,7 +3126,9 @@ cs_set_kv() {
   fi
 }
 
-# Put the cursor on the shown session, or on the first row when nothing is shown.
+# Put the cursor on the shown session. With nothing shown: on this project's
+# first session, or on its project row when it has none. This project need not
+# be at the top of the list.
 cs_sync_highlight_local() {
   local idx i
   if [[ -n "${SHOWN}" ]]; then
@@ -3110,12 +3138,35 @@ cs_sync_highlight_local() {
       return
     fi
   fi
+  local fallback=-1
   for ((i = 0; i < ${#ENTRIES_ID[@]}; i++)); do
-    if [[ "${ENTRIES_TYPE[${i}]}" != "header" && "${ENTRIES_TYPE[${i}]}" != "spacer" ]]; then
-      SELECTED=${i}
-      return
-    fi
+    case "${ENTRIES_TYPE[${i}]}" in
+      local)
+        SELECTED=${i}
+        return
+        ;;
+      header|spacer) ;;
+      *)
+        # this project's row, or the first row there is while it is not listed
+        if ((fallback < 0)) || [[ "${ENTRIES_PATH[${i}]}" == "${PWD}" ]]; then
+          fallback=${i}
+        fi
+        ;;
+    esac
   done
+  ((fallback < 0)) || SELECTED=${fallback}
+}
+
+# The project of the row the cursor is on, into the variable named $1: this
+# project for one of its own sessions, and for an empty list. Fails on a row
+# that belongs to no project.
+cs_cursor_project() {
+  local _cp_out="$1"
+  case "${ENTRIES_TYPE[${SELECTED}]:-}" in
+    local|"") printf -v "${_cp_out}" '%s' "${PWD}" ;;
+    project|remote) printf -v "${_cp_out}" '%s' "${ENTRIES_PATH[${SELECTED}]}" ;;
+    *) return 1 ;;
+  esac
 }
 
 cs_activate_selected() {
@@ -3124,6 +3175,8 @@ cs_activate_selected() {
   case "${ENTRIES_TYPE[${SELECTED}]}" in
     local) cs_show_session "${ENTRIES_ID[${SELECTED}]}" ;;
     project)
+      # this project's own row: there is nowhere to hop
+      [[ "${ENTRIES_PATH[${SELECTED}]}" == "${PWD}" ]] && return 0
       cs_switch_to_project "${ENTRIES_PATH[${SELECTED}]}"
       cs_sync_highlight_local
       ;;
@@ -3135,7 +3188,8 @@ cs_activate_selected() {
 }
 
 # Hop to another project's view. The launcher reads switch_target once this
-# client has detached: the project path, then the session to show there, if any.
+# client has detached: the project path, then what to do there, if anything:
+# the session to show, or `new` or `agents`.
 # pending_load is not written here. The launcher writes it after it has
 # initialized the target's state, because that wipes the state dir of a server
 # that is not running, which is the normal case for another project.
@@ -3146,15 +3200,55 @@ cs_switch_to_project() {
   _tmux detach-client 2>/dev/null || true
 }
 
-# A hop from another project's picker asked for a session to be shown here.
+# New session or agent view ($1 = new | agents) in this project.
+cs_run_action() {
+  case "$1" in
+    new)
+      cs_new_session && cs_focus_session
+      cs_select_shown
+      ;;
+    agents) cs_open_agents ;;
+  esac
+  DIRTY=1
+}
+
+# New session or agent view for the project under the cursor: here when that is
+# this project, else by hopping there, where that project's picker runs it.
+# $2 = 1 for a prefix key. Pressed while the picker is not focused, it means
+# this project, wherever the cursor was left.
+cs_route_action() {
+  local action="$1" from_prefix="${2:-0}" target="${PWD}" _pf="1"
+  if ((from_prefix)); then
+    _pf=$(_tmux display-message -t "${PICKER_PANE}" -p '#{pane_active}' 2>/dev/null || echo "1")
+    # a new session that fails says why in the picker
+    [[ "${action}" == "new" ]] && _tmux select-pane -t "${PICKER_PANE}"
+  fi
+  if [[ "${_pf}" == "1" ]]; then
+    cs_cursor_project target || target="${PWD}"
+  fi
+  if [[ "${target}" == "${PWD}" ]]; then
+    cs_run_action "${action}"
+    return 0
+  fi
+  cs_switch_to_project "${target}" "${action}"
+  cs_sync_highlight_local
+  DIRTY=1
+}
+
+# A hop from another project's picker asked for a session to be shown here, or
+# for a new session or agent view.
 cs_consume_pending_load() {
   local pending idx
   cs_read_state_into pending pending_load
   [[ -n "${pending}" ]] || return 0
   rm -f "${STATE_DIR}/pending_load"
-  [[ "${pending}" =~ ${ID_RE} ]] || return 0
+  [[ "${pending}" =~ ${ID_RE} || "${pending}" =~ ${ACTION_RE} ]] || return 0
   cs_poll 1 || true
   cs_rescan
+  if [[ "${pending}" =~ ${ACTION_RE} ]]; then
+    cs_run_action "${pending}"
+    return 0
+  fi
   cs_find_entry_index "${pending}" idx
   [[ "${idx}" != "-1" && "${ENTRIES_TYPE[${idx}]}" == "local" ]] || return 0
   SELECTED=${idx}
@@ -3209,11 +3303,13 @@ cs_read_line() {
   return 1
 }
 
-# Closes the view. Sessions belong to Claude's supervisor and keep running.
+# Closes every view, this project's last. Sessions belong to Claude's supervisor
+# and keep running.
 cs_confirm_shutdown() {
-  # The terminals live in this server and die with it. Say so when there are any.
+  # Terminals live in a view's server and die with it. Say so when any view
+  # has one.
   local prompt="Shutdown? y/N" f
-  for f in "${STATE_DIR}"/term/*; do
+  for f in "${STATE_DIR}"/term/* "${CS_STATE_ROOT}"/*/term/*; do
     if [[ -f "${f}" && "${f##*/}" != *.* ]]; then
       prompt="Shutdown, kill terminals? y/N"
       break
@@ -3222,6 +3318,24 @@ cs_confirm_shutdown() {
   cs_confirm "${CS_CLR_PROMPT_DANGER}" "${prompt}" || return 0
   stty echo 2>/dev/null || true
   printf '\e[?25h\e[0m'
+  # The other projects' views first: their servers, found by their sockets as
+  # claude-spaces finds its own, then their state. A state dir is one that holds
+  # project_path: nothing else under the state root goes.
+  local sock name dir
+  for sock in "${TMUX_TMPDIR:-/tmp}/tmux-${UID}"/csa-*; do
+    [[ -S "${sock}" ]] || continue
+    name="${sock##*/}"
+    [[ "${name}" == "${TMUX_SERVER}" ]] && continue
+    TMUX_SERVER="${name}" _tmux kill-server 2>/dev/null || true
+  done
+  if [[ -n "${CS_STATE_ROOT}" && "${CS_STATE_ROOT}" != "/" ]]; then
+    for dir in "${CS_STATE_ROOT}"/*/; do
+      dir="${dir%/}"
+      [[ -f "${dir}/project_path" && "${dir}" != "${STATE_DIR}" ]] || continue
+      rm -rf "${dir}"
+    done
+  fi
+  # This view last: the picker dies with its server.
   cs_remove_focus_hook
   cs_remove_keybindings
   rm -rf "${STATE_DIR}"
@@ -3230,14 +3344,10 @@ cs_confirm_shutdown() {
 
 cs_rename_project() {
   local target_path=""
-  local entry_type="${ENTRIES_TYPE[${SELECTED}]:-}"
   local sanitized=""
-  case "${entry_type}" in
-    local|"") target_path="${PWD}"; sanitized="${PWD_SANITIZED}" ;;
-    project|remote) target_path="${ENTRIES_PATH[${SELECTED}]}"; sanitized=$(cs_sanitize_path "${target_path}") ;;
-    *) return 0 ;;
-  esac
+  cs_cursor_project target_path || return 0
   [[ -n "${target_path}" ]] || return 0
+  sanitized=$(cs_sanitize_path "${target_path}")
 
   local old_name="${PROJECT_NAMES[${sanitized}]:-}"
   local width
@@ -3475,7 +3585,7 @@ cs_launch() {
         cd "${target_path}" || break
         cs_normalize_pwd
         TMUX_SERVER=$(cs_server_name "$PWD")
-        [[ "${target_id}" =~ ${ID_RE} ]] && pending="${target_id}"
+        [[ "${target_id}" =~ ${ID_RE} || "${target_id}" =~ ${ACTION_RE} ]] && pending="${target_id}"
         continue
       fi
     fi

@@ -273,13 +273,45 @@ load_breaks << 'BREAKS'
 -       _rf_name="(new session)"
 +       _rf_name="${_rf_id}"
 
-@@ another project's sessions are listed oldest first | test_other_projects_rows
--     cs_sort_memo order "remote:${proj}" "${lines}" -rnk1
-+     cs_sort_memo order "remote:${proj}" "${lines}" -nk1
+@@ only this project's sessions are sorted | test_project_rows
+-     cs_sort_entries "${start}" "${proj}"
++     [[ "${proj}" == "${PWD}" ]] && cs_sort_entries "${start}" "${proj}"
 
-@@ a custom project name is ignored in the list | test_other_projects_rows
+@@ a custom project name is ignored in the list | test_project_rows
 -     leaf="${PROJECT_NAMES[${sanitized}]:-${DISPLAY_NAMES[${proj}]:-${proj##*/}}}"
 +     leaf="${DISPLAY_NAMES[${proj}]:-${proj##*/}}"
+
+@@ two projects have no empty row between them | test_project_rows test_jump_numbers_drawn
+-       cs_entry_append "__spacer_proj_${sanitized}__" "" "0" "" "" "spacer" ""
++       :
+
+@@ a session of this project is listed as another project's | test_project_rows test_same_list_from_any_project
+-         type="local"
+
+@@ recent projects are listed by path | test_project_order
+-   [[ -n "${recent_in}" ]] && cs_sort_memo order projects:recent "${recent_in}" -t$'\x1f' -k1,1 -k2
++   [[ -n "${recent_in}" ]] && cs_sort_memo order projects:recent "${recent_in}" -t$'\x1f' -k2
+
+@@ the other projects are listed oldest first | test_project_order
+-     cs_sort_memo older projects:older "${older_in}" -t$'\x1f' -k1,1rn -k2
++     cs_sort_memo older projects:older "${older_in}" -t$'\x1f' -k1,1n -k2
+
+@@ a session that ended makes its project recent | test_project_order
+-         failed|stopped) ;;
+
+@@ this project is not listed while it has no session | test_project_order test_no_sessions_view
+-   sessions["${PWD}"]=""
+
+@@ this project with no session is listed among the old ones | test_project_order
+-     [[ -z "${sessions[${proj}]}" ]] && is_recent=1
+
+@@ this project is listed first | test_same_list_from_any_project
+-     [[ -z "${sessions[${proj}]}" ]] && is_recent=1
++     [[ "${proj}" == "${PWD}" ]] && is_recent=1
+
+@@ every project's sessions share one sort memo | test_sort_memo_per_project
+-     cs_sort_entries "${start}" "${proj}"
++     cs_sort_entries "${start}" shared
 
 @@ another project's sessions get no jump number | test_jump_slots test_jump_numbers_drawn test_jump_key_hops
 -       local|remote) ;;
@@ -489,28 +521,43 @@ load_breaks << 'BREAKS'
 -       prompt="Shutdown, kill terminals? y/N"
 +       prompt="Shutdown? y/N"
 
+@@ the shutdown question does not mention a terminal in another view | test_shutdown_prompt
+-   for f in "${STATE_DIR}"/term/* "${CS_STATE_ROOT}"/*/term/*; do
++   for f in "${STATE_DIR}"/term/*; do
+
 # ── what the picker draws ────────────────────────
 
-@@ another project's session keeps its indent next to a number | test_jump_numbers_drawn
--         if [[ "${entry_type}" == "remote" ]] && ((!SHOW_INDEX)); then
-+         if [[ "${entry_type}" == "remote" ]]; then
+@@ a session keeps its indent where its number goes | test_jump_numbers_drawn
+-         if ((!SHOW_INDEX)); then
++         if true; then
 
-@@ another project's session is not indented with show_index off | test_jump_numbers_drawn
+@@ a session is not indented with show_index off | test_jump_numbers_drawn
 -           [[ -n "${line_prefix}" ]] || indent=2
 +           :
+
+@@ only another project's sessions are indented with show_index off | test_jump_numbers_drawn
+-         if ((!SHOW_INDEX)); then
++         if [[ "${entry_type}" == "remote" ]] && ((!SHOW_INDEX)); then
+
+@@ this project's row is drawn like any other project's | test_current_project_marked
+-         [[ "${ENTRIES_PATH[${i}]}" == "${PWD}" ]] && line_color="${CS_CLR_BOLD}"
+
+@@ every project's row is bold | test_current_project_marked
+-         [[ "${ENTRIES_PATH[${i}]}" == "${PWD}" ]] && line_color="${CS_CLR_BOLD}"
++         line_color="${CS_CLR_BOLD}"
 
 @@ a process that goes away does not redraw the list | test_fingerprint_sees_process
 -     _fpv+="${UNSEEN_SET[${ENTRIES_ID[${i}]}]:-0}:${AG_STATUS[${ENTRIES_ID[${i}]}]:+proc}|"
 +     _fpv+="${UNSEEN_SET[${ENTRIES_ID[${i}]}]:-0}|"
 
-@@ a note is drawn at the left edge | test_footer_note test_empty_list_note
+@@ a note is drawn at the left edge | test_footer_note test_no_sessions_view
 -     cs_print_centered "$((row + 1 + i))" "${rows[i]}" "${width}" "${CS_CLR_BELL}"
 +     printf '\e[%d;1H\e[K%b%s\e[0m' "$((row + 1 + i))" "${CS_CLR_BELL}" "${rows[i]}"
 
-@@ a long note is cut, not split | test_footer_note test_empty_list_note
+@@ a long note is cut, not split | test_footer_note test_no_sessions_view
 -   [[ -n "${rest}" ]] && _rows+=("${rest:0:width}")
 
-@@ a long note is split in the middle of a word | test_footer_note test_empty_list_note
+@@ a long note is split in the middle of a word | test_footer_note test_no_sessions_view
 -   if [[ "${first}" == ?*" "* ]]; then
 +   if false; then
 
@@ -518,24 +565,16 @@ load_breaks << 'BREAKS'
 -   [[ -n "${rest}" ]] && _rows+=("${rest:0:width}")
 +   [[ -n "${rest}" ]] && _rows+=("${rest}")
 
-@@ a pane with no columns is not given one | test_empty_list_note
+@@ a pane with no columns is not given one | test_no_sessions_view
 -   ((width > 0)) || width=1
 
-@@ a note has no empty row above it | test_footer_note test_empty_list_note
+@@ a note has no empty row above it | test_footer_note test_no_sessions_view
 -     cs_print_centered "$((row + 1 + i))" "${rows[i]}" "${width}" "${CS_CLR_BELL}"
 +     cs_print_centered "$((row + i))" "${rows[i]}" "${width}" "${CS_CLR_BELL}"
 
 @@ a note is drawn in the dim colour | test_footer_note
 -     cs_print_centered "$((row + 1 + i))" "${rows[i]}" "${width}" "${CS_CLR_BELL}"
 +     cs_print_centered "$((row + 1 + i))" "${rows[i]}" "${width}"
-
-@@ the version is drawn over the note | test_footer_note
--       version_line=$((quit_line + 3 + ${#note_rows[@]}))
-+       version_line=$((quit_line + 2))
-
-@@ the version is drawn over the row below a two-row note | test_footer_note
--       version_line=$((quit_line + 3 + ${#note_rows[@]}))
-+       version_line=$((quit_line + 4))
 
 @@ a full list keeps its rows when a note is shown | test_footer_note
 -   ((${#note_rows[@]})) && avail=$((avail - ${#note_rows[@]} - 1))
@@ -544,7 +583,7 @@ load_breaks << 'BREAKS'
 -   ((${#note_rows[@]})) && avail=$((avail - ${#note_rows[@]} - 1))
 +   ((${#note_rows[@]})) && avail=$((avail - 2))
 
-@@ a failing poll is not shown as a note | test_footer_note
+@@ a failing poll is not shown as a note | test_footer_note test_no_sessions_view
 -   ((SEARCH_ACTIVE)) || note="${POLL_ERROR:-${FOOTER_MSG}}"
 +   ((SEARCH_ACTIVE)) || note="${FOOTER_MSG}"
 
@@ -552,23 +591,25 @@ load_breaks << 'BREAKS'
 -   ((SEARCH_ACTIVE)) || note="${POLL_ERROR:-${FOOTER_MSG}}"
 +   note="${POLL_ERROR:-${FOOTER_MSG}}"
 
-@@ a command's line is not shown with an empty list | test_empty_list_note
--     cs_render_note "${empty_note_row}" "${width}" "${FOOTER_MSG}" || true
+@@ the top bar shows the project | test_footer_note
+-   local title=" spaces-agents v${VERSION} "
++   local title=" ${PWD##*/} "
 
-@@ an empty list has a text | test_empty_list_note
--     local empty_msg=""
-+     local empty_msg="No sessions. :c starts one"
+@@ the list keeps a row free for the version | test_footer_note
+-   avail=$((height - 4))
++   avail=$((height - 5))
 
-@@ a long failing poll with an empty list has no second row | test_empty_list_note
--     if ((${#empty_rows[@]} > 1)); then
-+     if false; then
+@@ the footer is cleared from a row past the bottom | test_footer_note
+-     ((last_line < height)) && printf '\e[%d;1H\e[J' "$((last_line + 1))"
++     printf '\e[%d;1H\e[J' "$((last_line + 1))"
 
-@@ the second row of a failing poll is not indented | test_empty_list_note
--       printf '\e[3;1H%b  %s\e[0m' "${CS_CLR_CHROME}" "${empty_rows[1]}"
-+       printf '\e[3;1H%b%s\e[0m' "${CS_CLR_CHROME}" "${empty_rows[1]}"
+@@ a search with no matches says nothing | test_no_sessions_view
+-     ((SEARCH_ACTIVE)) && empty_msg="No matches."
 
-@@ a note is drawn over the second row of a failing poll | test_empty_list_note
--       empty_note_row=4
+@@ this project's own row offers a hop | test_no_sessions_view
+-     if [[ "${selected_type}" == "remote" || "${selected_type}" == "project" ]] \
+-        && [[ "${ENTRIES_PATH[${SELECTED}]}" != "${PWD}" ]]; then
++     if [[ "${selected_type}" == "remote" || "${selected_type}" == "project" ]]; then
 
 @@ a row with no process is drawn with the dim attribute | test_dim_is_grey
 - CS_CLR_DORMANT='\e[38;5;245m'
@@ -577,10 +618,6 @@ load_breaks << 'BREAKS'
 @@ the footer is drawn with the dim attribute | test_dim_is_grey
 - CS_CLR_CHROME='\e[38;5;245m'
 + CS_CLR_CHROME='\e[2m'
-
-@@ the section header is drawn with the dim attribute | test_dim_is_grey
-- CS_CLR_SECTION='\e[1;38;5;245m'
-+ CS_CLR_SECTION='\e[2;1m'
 
 @@ a row with a process is drawn with the dim attribute | test_dim_is_grey
 - CS_CLR_RUNNING=''
@@ -686,8 +723,67 @@ load_breaks << 'BREAKS'
 @@ a hop's request is never cleared | test_pending_load_shows_session
 -   rm -f "${STATE_DIR}/pending_load"
 
-@@ the launcher drops the session a hop asked for | test_e2e_hop
--         [[ "${target_id}" =~ ${ID_RE} ]] && pending="${target_id}"
+@@ the launcher drops what a hop asked for | test_e2e_hop test_e2e_new_in_other_project
+-         [[ "${target_id}" =~ ${ID_RE} || "${target_id}" =~ ${ACTION_RE} ]] && pending="${target_id}"
+
+@@ the launcher drops a command a hop asked for | test_e2e_new_in_other_project
+-         [[ "${target_id}" =~ ${ID_RE} || "${target_id}" =~ ${ACTION_RE} ]] && pending="${target_id}"
++         [[ "${target_id}" =~ ${ID_RE} ]] && pending="${target_id}"
+
+@@ a command a hop asked for is dropped by the picker | test_pending_load_shows_session
+-   [[ "${pending}" =~ ${ID_RE} || "${pending}" =~ ${ACTION_RE} ]] || return 0
++   [[ "${pending}" =~ ${ID_RE} ]] || return 0
+
+@@ this project's own row hops | test_hop_writes_switch_target
+-       [[ "${ENTRIES_PATH[${SELECTED}]}" == "${PWD}" ]] && return 0
+
+@@ with nothing shown the cursor is not put on this project's first session | test_hop_writes_switch_target
+-       local)
+-         SELECTED=${i}
+-         return
+-         ;;
+
+@@ with no session here the cursor goes to the top row | test_hop_writes_switch_target
+-         if ((fallback < 0)) || [[ "${ENTRIES_PATH[${i}]}" == "${PWD}" ]]; then
++         if ((fallback < 0)); then
+
+@@ a command on another project's row runs here | test_route_actions
+-   if [[ "${target}" == "${PWD}" ]]; then
++   if true; then
+
+@@ a prefix key pressed from another pane follows the cursor | test_route_actions
+-   if [[ "${_pf}" == "1" ]]; then
++   if true; then
+
+@@ a hop does not say which command to run | test_route_actions test_e2e_new_in_other_project
+-   cs_switch_to_project "${target}" "${action}"
++   cs_switch_to_project "${target}"
+
+@@ stop and remove do nothing on another project's session | test_stop_remove_other_project
+-     local|remote) ;;
+-     *) return 0 ;;
++     local) ;;
++     *) return 0 ;;
+
+@@ the menu has no Stop and Remove on another project's session | test_stop_remove_other_project
+-   if [[ "${ENTRIES_TYPE[${SELECTED}]:-}" == "local" || "${ENTRIES_TYPE[${SELECTED}]:-}" == "remote" ]]; then
++   if [[ "${ENTRIES_TYPE[${SELECTED}]:-}" == "local" ]]; then
+
+@@ the menu has Stop and Remove on a project row | test_stop_remove_other_project
+-   if [[ "${ENTRIES_TYPE[${SELECTED}]:-}" == "local" || "${ENTRIES_TYPE[${SELECTED}]:-}" == "remote" ]]; then
++   if true; then
+
+@@ another project's view survives a shutdown | test_e2e_shutdown_closes_every_view
+-     TMUX_SERVER="${name}" _tmux kill-server 2>/dev/null || true
++     :
+
+@@ another project's state is left behind by a shutdown | test_e2e_shutdown_closes_every_view
+-       rm -rf "${dir}"
++       :
+
+@@ a directory that is no view's state is removed by a shutdown | test_e2e_shutdown_closes_every_view
+-       [[ -f "${dir}/project_path" && "${dir}" != "${STATE_DIR}" ]] || continue
++       [[ "${dir}" != "${STATE_DIR}" ]] || continue
 
 # ── terminals ────────────────────────────────────
 
@@ -821,7 +917,7 @@ load_breaks << 'BREAKS'
 -       DISPLAY_NAMES["${_p}"]="${_leaf}"
 +       DISPLAY_NAMES["${_p}"]="${_p}"
 
-@@ projects with the same folder name are not told apart | test_display_names_same_leaf_different_parent test_display_names_deep_divergence test_display_names_three_way_collision test_other_projects_rows
+@@ projects with the same folder name are not told apart | test_display_names_same_leaf_different_parent test_display_names_deep_divergence test_display_names_three_way_collision test_project_rows
 -       cs_resolve_collision_group group
 
 @@ long paths are not shortened | test_display_names_deep_divergence test_display_names_compression

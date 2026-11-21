@@ -839,9 +839,9 @@ test_poll_failure_keeps_list() {
   assert_eq "error after recovery" "${POLL_ERROR}" ""
 }
 
-# Recent sessions first: the ones that are not dim, then by name. Then the rest
-# by last activity; ended ones never sort as recent. A session with no prompt
-# yet is named for what it is.
+# The rows that are not dim first: the recent ones by name, then the rest by last
+# activity; ended ones never sort as recent. Then the closed ones, the dim rows,
+# by last activity alone. A session with no prompt yet is named for what it is.
 test_order_and_names() {
   local now
   now=$(date +%s)
@@ -852,21 +852,29 @@ test_order_and_names() {
   fake_add aaaaaaa5 failed "" "aaa"
   fake_add aaaaaaa6 blocked idle "aaaaaaa6"
   fake_add aaaaaaa7 done "" "Aardvark"
+  fake_add aaaaaaa8 done "" "Mango"
+  fake_add aaaaaaa9 failed "" "Abacus"
   fake_transcript aaaaaaa1 $((now - 60))
   fake_transcript aaaaaaa2 $((now - 120))
   fake_transcript aaaaaaa3 $((now - 3600))
   fake_transcript aaaaaaa4 $((now - 7200))
   fake_transcript aaaaaaa5 $((now - 30))
-  fake_transcript aaaaaaa7 $((now - 90))
+  fake_transcript aaaaaaa7 $((now - 20))
+  fake_transcript aaaaaaa8 $((now - 5000))
+  fake_transcript aaaaaaa9 $((now - 40))
+  seen_at aaaaaaa9 $((now - 600))
   cs_poll 1 || { fail "poll failed"; return 1; }
   cs_rescan
   local names
   names=$(printf '%s|' "${ENTRIES_NAME[@]}")
   # The first row is the project's own.
-  # Aardvark is recent but was stopped while idle: it has no process, so it comes
-  # after the recent ones that have one, whatever its name.
+  # Abacus failed and was not looked at since: its row is a bell, not dim, so it
+  # is not closed. It ended, so it is not recent either, whatever its name.
   # the promptless one has no transcript: it sorts by when it started, long ago
-  assert_eq "order" "${names}" "project|Alpha|beta|Aardvark|aaa (failed)|zeta|eta|(new session)|"
+  # Aardvark, aaa and Mango have no process. They come after every row that has
+  # one, though two of them were active last of all, and by age, not by name:
+  # Mango, older than zeta and newer than eta, is not between the two.
+  assert_eq "order" "${names}" "project|Alpha|beta|Abacus (failed)|zeta|eta|(new session)|Aardvark|aaa (failed)|Mango|"
 }
 
 # Every project is a project row with its sessions under it, and an empty row
@@ -905,10 +913,10 @@ test_project_rows() {
   assert_eq "a remote row carries its project path" "${ENTRIES_PATH[${idx}]}" "/work/client-a/api"
 }
 
-# Projects with a session that sorts as recent come first, by name. The rest
-# follow, most recent first. A session that ended does not make its project
-# recent. This project is where the rule puts it, and while it has no session
-# it is listed as recent, which is where its first session will put it.
+# Projects with a session active within the threshold come first, by name. The
+# rest follow, most recent first. A session that ended does not make its
+# project recent. This project is where the rule puts it, and while it has no
+# session it is listed as recent, which is where its first session will put it.
 test_project_order() {
   local now
   now=$(date +%s)

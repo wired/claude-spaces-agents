@@ -221,10 +221,11 @@ cs_create_default_config() {
 # Picker pane width: characters (e.g. 30) or percentage (e.g. 20%)
 # picker_width=30
 
-# Sessions active within this many minutes sort at the top of their project
-# (the ones that are not dim first, then by name); the rest sort by most recent
-# activity below them. Projects sort the same way: the ones with such a session
-# first, by name, then the rest by most recent activity.
+# Sessions active within this many minutes sort at the top of their project, by
+# name; the rest sort by most recent activity below them. Closed sessions (the
+# dim rows) come last in their project, by most recent activity alone. Projects
+# with a session active within this many minutes come first, by name, then the
+# rest by most recent activity.
 # recent_threshold=10
 
 # Picker pane position: "right" (default) or "left"
@@ -895,18 +896,24 @@ cs_sort_memo() {
 }
 
 # Sort one project's sessions: the rows from index $1 to the end, memoized under
-# $2. Sessions active within recent_threshold minutes first: the ones that are
-# not dim, then by name. Then the rest, most recent first. Ended sessions
-# (failed, stopped) always sort with the rest. The lines that are sorted carry a
-# row's place within its project, so a project keeps its order wherever it is
-# in the list.
+# $2. Closed sessions (the dim rows) come after every other one, most recent
+# first. Before them, the sessions active within recent_threshold minutes, by
+# name, then the rest, most recent first. Ended sessions (failed, stopped) never
+# sort as recent. The lines that are sorted carry a row's place within its
+# project, so a project keeps its order wherever it is in the list.
 cs_sort_entries() {
   local start="$1" key="$2"
   local n=${#ENTRIES_ID[@]}
   ((n - start <= 1)) && return 0
 
-  local recent_indices=() older_indices=() i
+  local recent_indices=() older_indices=() open=() i look
   for ((i = start; i < n; i++)); do
+    cs_row_look look "${ENTRIES_ID[${i}]}" "${ENTRIES_STATUS[${i}]}"
+    if [[ "${look}" == "dormant" ]]; then
+      older_indices+=("${i}")
+      continue
+    fi
+    open[i]=1
     case "${ENTRIES_STATUS[i]}" in
       failed|stopped)
         older_indices+=("${i}")
@@ -921,27 +928,24 @@ cs_sort_entries() {
     esac
   done
 
-  # Sort recent by not-dim-first, then name (case-insensitive); index first to handle spaces
+  # Sort recent by name (case-insensitive); index first to handle spaces
   local sorted_recent=""
   if ((${#recent_indices[@]} > 0)); then
-    local _rin="" rank look
+    local _rin=""
     for i in "${recent_indices[@]}"; do
-      rank=1
-      cs_row_look look "${ENTRIES_ID[${i}]}" "${ENTRIES_STATUS[${i}]}"
-      [[ "${look}" != "dormant" ]] && rank=0
-      _rin+="${_rin:+$'\n'}$((i - start)) ${rank} ${ENTRIES_NAME[${i}],,}"
+      _rin+="${_rin:+$'\n'}$((i - start)) ${ENTRIES_NAME[${i}],,}"
     done
-    cs_sort_memo sorted_recent "recent:${key}" "${_rin}" -t' ' -k2,2 -k3
+    cs_sort_memo sorted_recent "recent:${key}" "${_rin}" -t' ' -k2
   fi
 
-  # Sort older by last activity, descending
+  # Sort older by not-closed-first, then last activity, descending
   local sorted_older=""
   if ((${#older_indices[@]} > 0)); then
     local _oin=""
     for i in "${older_indices[@]}"; do
-      _oin+="${_oin:+$'\n'}${ENTRIES_MTIME[${i}]} $((i - start))"
+      _oin+="${_oin:+$'\n'}${open[i]:-0} ${ENTRIES_MTIME[${i}]} $((i - start))"
     done
-    cs_sort_memo sorted_older "older:${key}" "${_oin}" -rnk1
+    cs_sort_memo sorted_older "older:${key}" "${_oin}" -rn -k1,1 -k2,2
   fi
 
   # the rows above this project stay as they are
@@ -963,7 +967,7 @@ cs_sort_entries() {
     done <<< "${sorted_recent}"
   fi
   if [[ -n "${sorted_older}" ]]; then
-    while read -r _ idx; do
+    while read -r _ _ idx; do
       idx=$((idx + start))
       new_id+=("${ENTRIES_ID[${idx}]}")
       new_name+=("${ENTRIES_NAME[${idx}]}")
@@ -1011,9 +1015,10 @@ cs_build_all_entries() {
   [[ -n "${projs}" ]] && cs_sort_memo sorted projects "${projs}"
   cs_other_projects_names "${sorted}"
 
-  # A project is recent when one of its sessions sorts as recent. Recent projects
-  # come first, by name; the rest follow, most recent first. Both end on the
-  # path, so two projects never tie.
+  # A project is recent when one of its sessions that has not ended was active
+  # within recent_threshold minutes, closed or not. Recent projects come first,
+  # by name; the rest follow, most recent first. Both end on the path, so two
+  # projects never tie.
   local sanitized leaf newest is_recent recent_in="" older_in=""
   local -A leaves=()
   for proj in "${!sessions[@]}"; do

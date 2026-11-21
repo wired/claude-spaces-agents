@@ -337,10 +337,11 @@ own, and no line sets the others apart.
 This is not how claude-spaces does it: there the picker's own project comes first. With one
 terminal window and hops between projects, that order changed at every hop.
 
-- **Order.** A project is recent when one of its sessions sorts as recent (§ Session rows).
-  Recent projects come first, by name without regard to case, then by path. The rest follow by
-  their most recent activity, then by name, then by path. Recent projects are not sorted by
-  activity: two projects with a working session each would change places at every poll.
+- **Order.** A project is recent when one of its sessions that has not ended was active within
+  `recent_threshold` minutes, closed or not. Recent projects come first, by name without regard
+  to case, then by path. The rest follow by their most recent activity, then by name, then by
+  path. Recent projects are not sorted by activity: two projects with a working session each
+  would change places at every poll.
 - **The picker's own project** is the row in bold. It is the project a prefix key pressed from
   another pane acts on (§ Actions). While it has no session it is listed as recent, which is
   where its first session will put it. So the list is never empty.
@@ -379,11 +380,16 @@ alone does not change when its session is stopped. Claude putting an idle sessio
 an hour looks the same, and is the same thing. The list is drawn again when a process comes or
 goes, even though the state is the same.
 
-Order and the age column work as in claude-spaces, on last activity (§ Last activity), within
-each project. Sessions active within `recent_threshold` minutes come first: the ones that are
-not dim, then by name, as claude-spaces puts its running sessions first. The rest follow, most
+Order and the age column go by last activity (§ Last activity), within each project. Closed
+sessions, the dim rows, come after every row that is not dim, most recent first: the threshold
+plays no part in their place. The rows that are not dim are ordered as in claude-spaces:
+sessions active within `recent_threshold` minutes come first, by name. The rest follow, most
 recent first; ended sessions always sort there. `startedAt` is not used for order: it is the
 process start and moves when a session is woken.
+
+This is not how claude-spaces does it: there a session that is not running shares both blocks
+with the running ones, and only comes after them among the recent. Here that put a session
+stopped a moment ago above an open one that had been idle for a while.
 
 A session row takes a jump number (§ Actions). With `show_index` off it is indented under its
 project instead.

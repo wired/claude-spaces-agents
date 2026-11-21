@@ -265,9 +265,18 @@ load_breaks << 'BREAKS'
 +       failed|stopped)
 +         recent_indices+=("${i}")
 
-@@ a recent session with no process sorts among the ones that have one | test_order_and_names
--       [[ "${look}" != "dormant" ]] && rank=0
-+       rank=0
+@@ a closed session that was active a moment ago sorts as recent | test_order_and_names
+-     if [[ "${look}" == "dormant" ]]; then
+-       older_indices+=("${i}")
+-       continue
+-     fi
+
+@@ closed sessions are listed among the ones that are not, by age | test_order_and_names
+-     open[i]=1
+
+@@ a project's sessions are listed oldest first | test_order_and_names
+-     cs_sort_memo sorted_older "older:${key}" "${_oin}" -rn -k1,1 -k2,2
++     cs_sort_memo sorted_older "older:${key}" "${_oin}" -n -k1,1r -k2,2
 
 @@ a promptless session is shown by its id | test_order_and_names
 -       _rf_name="(new session)"
